@@ -1,7 +1,5 @@
 // Typed errors raised across the daemon. AkashApiError represents a server-side
-// non-2xx (NOT retriable via proxy fallback). AllExhaustedError is thrown by the
-// rotator when every account is in the exhausted set — orchestrator catches it
-// to shut down cleanly.
+// non-2xx (NOT retriable via proxy fallback).
 
 // Keys redacted before storing on AkashApiError.body. Keep this list small;
 // the goal is to avoid logs leaking creds if a misbehaving gateway echoes a
@@ -31,9 +29,3 @@ export class AkashApiError extends Error {
   }
 }
 
-export class AllExhaustedError extends Error {
-  constructor(message = "all accounts exhausted") {
-    super(message);
-    this.name = "AllExhaustedError";
-  }
-}

@@ -47,6 +47,32 @@ test("logger: no file path → stdout-only without throwing", () => {
   log.info("noop", {});
 });
 
+test("logger: concurrent child writers — interleaved lines parse cleanly with correct account field", async () => {
+  const { readFileSync } = await import("node:fs");
+  const path = resolve(tmpdir(), `log-concurrent-${Date.now()}-${Math.random()}.log`);
+  const log = createLogger(path);
+  const a = log.child({ account: "a" });
+  const b = log.child({ account: "b" });
+  for (let i = 0; i < 50; i++) {
+    a.info("cycle.start", { i });
+    b.info("cycle.start", { i });
+  }
+  await log.drain();
+  const lines = readFileSync(path, "utf8").trim().split("\n");
+  assert.equal(lines.length, 100);
+  let countA = 0;
+  let countB = 0;
+  for (const ln of lines) {
+    const obj = JSON.parse(ln);
+    assert.ok(obj.account === "a" || obj.account === "b", `unexpected account: ${obj.account}`);
+    if (obj.account === "a") countA++;
+    else countB++;
+  }
+  assert.equal(countA, 50);
+  assert.equal(countB, 50);
+  await unlink(path).catch(() => {});
+});
+
 test("logger: drain() flushes pending writes synchronously after await", async () => {
   const { readFileSync } = await import("node:fs");
   const path = resolve(tmpdir(), `log-drain-${Date.now()}-${Math.random()}.log`);

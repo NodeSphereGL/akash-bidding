@@ -24,6 +24,15 @@ Logs are appended to `./logs/akash-bidding.log` (JSONL). Tail with:
 tail -f logs/akash-bidding.log | jq .
 ```
 
+Each account runs its own concurrent loop in the same process, so log lines from different accounts interleave. Filter by account name via the `.account` field:
+
+```bash
+tail -f logs/akash-bidding.log | jq -c 'select(.account=="alpha")'
+tail -f logs/akash-bidding.log | jq -c '{ts, account, event}'    # compact per-account event stream
+```
+
+Lease success (`event=="lease.success"`) puts only that account into the 1h hold (`cycle.hold`). Other accounts keep cycling independently.
+
 ## PM2
 
 ```bash
@@ -97,8 +106,8 @@ The daemon exits 0 on the all-accounts-depleted condition (Telegram is sent) —
 
 ### What is NOT restored after restart
 
-- Round-robin cursor → resets to 0
-- Exhausted-set → cleared (balance is re-checked from scratch per account)
+- Per-account `noMatchStreak` counters → reset to 0
+- Exhausted-set (accounts that returned 401 / insufficient credit / no-match exhaustion) → cleared; balance is re-checked from scratch per account
 - Active deployments → not tracked; Akash will auto-evict them when deposit drains
 
 This is intentional: v1 has no persistence layer.
