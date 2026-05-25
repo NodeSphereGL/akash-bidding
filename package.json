@@ -1,0 +1,23 @@
+{
+  "name": "akash-bidding",
+  "version": "0.1.0",
+  "description": "Long-running daemon that auto-creates Akash deployments, polls bids, leases first matching GPU under uact/block cap, and notifies Telegram. Multi-account rotation with per-account HTTP proxy.",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "probe": "node scripts/probe.js",
+    "check-proxy": "node scripts/check-proxy-ip.js",
+    "test-telegram": "node scripts/test-telegram.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "undici": "^6.19.8",
+    "yaml": "^2.5.1"
+  },
+  "private": true
+}

@@ -1,0 +1,12 @@
+[
+  {
+    "name": "trial-1",
+    "apiKey": "REPLACE_ME",
+    "proxy": "http://user:pass@1.2.3.4:8080"
+  },
+  {
+    "name": "trial-2",
+    "apiKey": "REPLACE_ME",
+    "proxy": null
+  }
+]

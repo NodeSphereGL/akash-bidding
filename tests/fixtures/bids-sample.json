@@ -1,0 +1,110 @@
+[
+  {
+    "id": { "owner": "akash1own", "dseq": "1001", "gseq": 1, "oseq": 1, "provider": "akash1prov1", "bseq": 92 },
+    "state": "open",
+    "price": { "amount": "90000", "denom": "uact" },
+    "resources_offer": [
+      {
+        "resources": {
+          "gpu": {
+            "attributes": [{ "key": "model", "value": "nvidia-a100-sxm4" }]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": { "owner": "akash1own", "dseq": "1001", "gseq": 1, "oseq": 1, "provider": "akash1prov2", "bseq": 93 },
+    "state": "open",
+    "price": { "amount": "75000", "denom": "uact" },
+    "resources_offer": [
+      {
+        "resources": {
+          "gpu": {
+            "attributes": [{ "key": "model", "value": "nvidia-rtx4090" }]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": { "owner": "akash1own", "dseq": "1001", "gseq": 1, "oseq": 1, "provider": "akash1prov3", "bseq": 94 },
+    "state": "open",
+    "price": { "amount": "100000", "denom": "uact" },
+    "resources_offer": [
+      {
+        "resources": {
+          "gpu": {
+            "attributes": { "model": "nvidia-h100-pcie" }
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": { "owner": "akash1own", "dseq": "1001", "gseq": 1, "oseq": 1, "provider": "akash1prov4", "bseq": 95 },
+    "state": "open",
+    "price": { "amount": "60000", "denom": "uact" },
+    "resources_offer": [
+      {
+        "resources": {
+          "gpu": {
+            "attributes": [{ "key": "model", "value": "NVIDIA-RTX3090" }]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": { "owner": "akash1own", "dseq": "1001", "gseq": 1, "oseq": 1, "provider": "akash1prov5", "bseq": 96 },
+    "state": "open",
+    "price": { "amount": "999999", "denom": "uact" },
+    "resources_offer": [
+      {
+        "resources": {
+          "gpu": {
+            "attributes": [{ "key": "model", "value": "nvidia-rtx5090" }]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": { "owner": "akash1own", "dseq": "1001", "gseq": 1, "oseq": 1, "provider": "akash1prov6", "bseq": 97 },
+    "state": "closed",
+    "price": { "amount": "70000", "denom": "uact" },
+    "resources_offer": [
+      {
+        "resources": {
+          "gpu": {
+            "attributes": [{ "key": "model", "value": "nvidia-rtx4080" }]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": { "owner": "akash1own", "dseq": "1001", "gseq": 1, "oseq": 1, "provider": "akash1prov7", "bseq": 98 },
+    "state": "open",
+    "price": { "amount": "50000", "denom": "uact" },
+    "resources_offer": [
+      {
+        "resources": {}
+      }
+    ]
+  },
+  {
+    "id": { "owner": "akash1own", "dseq": "1001", "gseq": 1, "oseq": 1, "provider": "akash1prov8", "bseq": 99 },
+    "state": "open",
+    "price": { "amount": "100000", "denom": "uact" },
+    "resources_offer": [
+      {
+        "resources": {
+          "gpu": {
+            "attributes": [{ "key": "vendor/nvidia/model/pro6000se", "value": "" }]
+          }
+        }
+      }
+    ]
+  }
+]

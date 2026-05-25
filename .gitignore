@@ -1,0 +1,8 @@
+node_modules/
+.env
+.env.local
+accounts.json
+logs/
+scripts/probe-output/
+*.log
+.DS_Store
