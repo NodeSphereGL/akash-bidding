@@ -7,6 +7,22 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { loadConfig, uactPerBlockToUsdPerHour } from "./config.js";
+
+function summarizeResources(bid) {
+  const offer = bid?.resources_offer?.[0]?.resources;
+  if (!offer) return null;
+  const gpu = offer.gpu || {};
+  const gpuAttrs = Array.isArray(gpu.attributes)
+    ? gpu.attributes.map((a) => ({ k: a?.key, v: a?.value }))
+    : gpu.attributes;
+  return {
+    cpu: offer.cpu?.units?.val,
+    memory: offer.memory?.quantity?.val,
+    storage: Array.isArray(offer.storage) ? offer.storage.map((s) => s?.quantity?.val) : offer.storage?.quantity?.val,
+    gpuUnits: gpu.units?.val,
+    gpuAttrs,
+  };
+}
 import { createLogger } from "./logger.js";
 import { loadAccounts } from "./accounts-loader.js";
 import { filterAndRank } from "./bidder.js";
@@ -80,7 +96,9 @@ async function pollAndLease({ ctx, dseq, owner, manifest, config, logger, akash,
         dseq,
         provider: candidate.provider,
         uactPerBlock: candidate.uactPerBlock,
+        usdPerHour: Number(uactPerBlockToUsdPerHour(candidate.uactPerBlock).toFixed(4)),
         model: candidate.model,
+        resources: summarizeResources(candidate.bid),
       });
       return { leased: true, lease, bid: candidate };
     } catch (err) {
@@ -89,6 +107,11 @@ async function pollAndLease({ ctx, dseq, owner, manifest, config, logger, akash,
         model: candidate.model,
         status: err?.status,
         error: err.message,
+        uactPerBlock: candidate.uactPerBlock,
+        usdPerHour: Number(uactPerBlockToUsdPerHour(candidate.uactPerBlock).toFixed(4)),
+        compositeId: candidate.compositeId,
+        resources: summarizeResources(candidate.bid),
+        apiBody: err?.body,
       });
     }
   }
