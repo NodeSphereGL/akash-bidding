@@ -5,6 +5,7 @@
 
 const TELEGRAM_API = "https://api.telegram.org";
 const MAX_MSG_LEN = 4000;
+const TELEGRAM_TIMEOUT_MS = 10_000;
 
 function htmlEscape(s) {
   return String(s)
@@ -26,6 +27,8 @@ function truncate(s, max) {
 export async function sendTelegram(message, cfg) {
   const { botToken, chatId, logger } = cfg || {};
   if (!botToken || !chatId) return false;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TELEGRAM_TIMEOUT_MS);
   try {
     const url = `${TELEGRAM_API}/bot${botToken}/sendMessage`;
     const res = await fetch(url, {
@@ -36,6 +39,7 @@ export async function sendTelegram(message, cfg) {
         text: truncate(message, MAX_MSG_LEN),
         parse_mode: "HTML",
       }),
+      signal: ctl.signal,
     });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
@@ -46,11 +50,13 @@ export async function sendTelegram(message, cfg) {
   } catch (err) {
     logger?.warn?.("telegram.send.error", { error: err.message });
     return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-export async function notifyLeaseSuccess({ bid, lease, account }, cfg) {
-  const msg = [
+export async function notifyLeaseSuccess({ bid, lease, account, group, putStatus }, cfg) {
+  const lines = [
     "🎯 <b>Akash Lease Acquired</b>",
     `<code>${new Date().toISOString()}</code>`,
     "",
@@ -60,11 +66,47 @@ export async function notifyLeaseSuccess({ bid, lease, account }, cfg) {
     `Provider: <code>${htmlEscape(bid?.provider ?? "?")}</code>`,
     `dseq: <code>${htmlEscape(lease?.dseq ?? bid?.compositeId?.dseq ?? "?")}</code>`,
     `Lease: <code>${htmlEscape(lease?.id ?? lease?.leaseId ?? "?")}</code>`,
+  ];
+  if (group) lines.push(`Group: <b>${htmlEscape(group)}</b>`);
+  if (putStatus) lines.push(`PUT: <b>${htmlEscape(putStatus)}</b>`);
+  lines.push("", "Deposit: $5.00", "Next cycle in 1h.");
+  return sendTelegram(lines.join("\n"), cfg);
+}
+
+export async function notifyPutFailed({ dseq, reason, group, account }, cfg) {
+  const msg = [
+    "❌ <b>Akash PUT Failed</b>",
+    `<code>${new Date().toISOString()}</code>`,
     "",
-    "Deposit: $5.00",
-    "Next cycle in 1h.",
+    `Account: <b>${htmlEscape(account?.name ?? "?")}</b>`,
+    `dseq: <code>${htmlEscape(dseq ?? "?")}</code>`,
+    `Group: <code>${htmlEscape(group ?? "n/a")}</code>`,
+    `Reason: ${htmlEscape(reason ?? "unknown")}`,
+    "",
+    "Deployment is alive but running placeholder image. Fix manually or release group.",
   ].join("\n");
   return sendTelegram(msg, cfg);
+}
+
+export async function notifyPutFailedNag(group, cfg) {
+  const msg = [
+    "⚠️ <b>PUT FAILED — manual action required</b>",
+    `<code>${new Date().toISOString()}</code>`,
+    "",
+    `Group: <b>${htmlEscape(group?.name ?? "?")}</b>`,
+    `dseq: <code>${htmlEscape(group?.locked_dseq ?? "?")}</code>`,
+    `Account ID: ${htmlEscape(group?.locked_by_account_id ?? "?")}`,
+    `Locked at: <code>${htmlEscape(group?.locked_at ?? "?")}</code>`,
+    `Expires at: <code>${htmlEscape(group?.expires_at ?? "?")}</code>`,
+    `Last error: ${htmlEscape(group?.last_error ?? "n/a")}`,
+    "",
+    `Resolve via: POST /v1/groups/${htmlEscape(group?.name ?? "")}/release  OR  PUT /v1/groups/${htmlEscape(group?.name ?? "")} {status:"AVAILABLE"}`,
+  ].join("\n");
+  return sendTelegram(msg, cfg);
+}
+
+export async function notifySweepRelease(count, cfg) {
+  return sendTelegram(`🧹 Sweeper released ${Number(count) || 0} group lock(s).`, cfg);
 }
 
 export async function notifyAllDepleted(accountsCount, cfg) {

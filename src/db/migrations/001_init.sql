@@ -1,0 +1,46 @@
+-- Group-aware auto-lease state. Idempotent via IF NOT EXISTS.
+
+CREATE TABLE IF NOT EXISTS `groups` (
+  name VARCHAR(64) PRIMARY KEY,
+  branch VARCHAR(128) NOT NULL,
+  status ENUM('AVAILABLE','LOCKED','PUT_FAILED','DISABLED') NOT NULL DEFAULT 'AVAILABLE',
+  locked_by_account_id INT NULL,
+  locked_dseq VARCHAR(32) NULL,
+  locked_at DATETIME NULL,
+  expires_at DATETIME NULL,
+  last_nag_at DATETIME NULL,
+  last_error TEXT NULL,
+  notes TEXT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_status_name (status, name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS accounts (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(64) UNIQUE NOT NULL,
+  api_key VARCHAR(255) NOT NULL,
+  proxy VARCHAR(512) NULL,
+  enabled BOOLEAN DEFAULT TRUE,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS deployments (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  dseq VARCHAR(32) UNIQUE NOT NULL,
+  account_id INT NOT NULL,
+  group_name VARCHAR(64) NULL,
+  provider VARCHAR(128) NULL,
+  uact_per_block INT NULL,
+  status ENUM('CREATED','LEASED','PUT_OK','PUT_FAILED','EXPIRED','CLOSED') NOT NULL,
+  leased_at DATETIME NULL,
+  expires_at DATETIME NULL,
+  put_attempts INT DEFAULT 0,
+  last_error TEXT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_account_status (account_id, status),
+  CONSTRAINT fk_deployments_account FOREIGN KEY (account_id) REFERENCES accounts(id),
+  CONSTRAINT fk_deployments_group FOREIGN KEY (group_name) REFERENCES `groups`(name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

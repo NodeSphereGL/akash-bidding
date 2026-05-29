@@ -3,7 +3,6 @@
 // when every account returns EXHAUSTED, it notifies, cools off, and respawns.
 // SIGINT/SIGTERM aborts all loops via a shared AbortController.
 
-import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { loadConfig, uactPerBlockToUsdPerHour } from "./config.js";
@@ -24,11 +23,17 @@ function summarizeResources(bid) {
   };
 }
 import { createLogger } from "./logger.js";
-import { loadAccounts } from "./accounts-loader.js";
+import { loadAccountsFromDb } from "./accounts-loader.js";
 import { filterAndRank } from "./bidder.js";
 import * as akashImpl from "./akash.js";
 import { AkashApiError } from "./errors.js";
 import * as notifyImpl from "./notify.js";
+import * as sdlMod from "./sdl.js";
+import * as groupsRepo from "./db/repo/groups.js";
+import * as deploymentsRepo from "./db/repo/deployments.js";
+import { createPool, closePool, ping as dbPing } from "./db/pool.js";
+import { startSweeper } from "./sweeper.js";
+import { startApiServer } from "./api/server.js";
 
 const sleep = (ms, signal) => new Promise((resolve) => {
   if (signal?.aborted) return resolve();
@@ -118,16 +123,34 @@ async function pollAndLease({ ctx, dseq, owner, manifest, config, logger, akash,
   return { leased: false };
 }
 
+function addHours(date, hours) {
+  return new Date(date.getTime() + hours * 3600_000);
+}
+
 /**
  * Runs the bidding loop for one account. Returns when the account exhausts
  * itself or when the shared abortSignal fires.
  *
  * @param {object} account
- * @param {{ config: object, sdl: string, logger: object, notify: object, akash: object, abortSignal?: AbortSignal }} deps
+ * @param {{
+ *   config: object,
+ *   sdl: string,
+ *   sdlTemplate?: object,
+ *   logger: object,
+ *   notify: object,
+ *   akash: object,
+ *   sdlMod?: object,
+ *   groupsRepo?: object,
+ *   deploymentsRepo?: object,
+ *   abortSignal?: AbortSignal,
+ * }} deps
  * @returns {Promise<{ reason: string }>}
  */
 export async function runAccountLoop(account, deps) {
-  const { config, sdl, logger, notify, akash, abortSignal } = deps;
+  const { config, sdl, sdlTemplate, logger, notify, akash, abortSignal } = deps;
+  const sdlInjector = deps.sdlMod;
+  const groupsRepoDep = deps.groupsRepo;
+  const deploymentsRepoDep = deps.deploymentsRepo;
   const loopLog = logger.child({ account: account.name });
   loopLog.info("account.loop.start", {});
 
@@ -199,9 +222,91 @@ export async function runAccountLoop(account, deps) {
 
       if (result.leased) {
         noMatchStreak = 0;
+        const tg = tgCfg(config, cycleLog);
+        const now = new Date();
+        const expiresAt = addHours(now, config.GROUP_LOCK_HOURS);
+
+        // 1. record the lease as a deployments audit row (only when DB wired)
+        if (deploymentsRepoDep) {
+          try {
+            await deploymentsRepoDep.insert({
+              dseq,
+              accountId: account.id,
+              provider: result.bid?.provider ?? null,
+              uactPerBlock: result.bid?.uactPerBlock ?? null,
+              status: "LEASED",
+              leasedAt: now,
+              expiresAt,
+            });
+          } catch (err) {
+            cycleLog.error("db.deployment.insert.failed", { dseq, error: err.message });
+          }
+        }
+
+        // 2. lock next available group (only when DB wired)
+        let group = null;
+        if (groupsRepoDep) {
+          try {
+            group = await groupsRepoDep.lockNextAvailable(account.id, dseq, config.GROUP_LOCK_HOURS);
+          } catch (err) {
+            cycleLog.error("db.group.lock.failed", { dseq, error: err.message });
+          }
+        }
+
+        let putStatus = groupsRepoDep ? "SKIPPED" : null;
+        if (groupsRepoDep && !group) {
+          cycleLog.warn("group.none-available", { dseq });
+          if (deploymentsRepoDep) {
+            await deploymentsRepoDep.updateStatus(dseq, "PUT_FAILED", {
+              last_error: "no available group",
+            }).catch((e) => cycleLog.warn("db.deployment.update.failed", { error: e.message }));
+          }
+          if (notify.notifyPutFailed) {
+            await notify.notifyPutFailed(
+              { dseq, reason: "no available group", group: null, account },
+              tg,
+            );
+          }
+          putStatus = "NO_GROUP";
+        } else if (group && sdlTemplate && sdlInjector) {
+          // 3. inject GROUP_NAME and PUT new SDL
+          try {
+            const newSdl = sdlInjector.injectGroupName(sdlTemplate, group.name);
+            await akash.updateDeployment({ account, config, logger: cycleLog }, dseq, newSdl);
+            if (deploymentsRepoDep) {
+              await deploymentsRepoDep.updateStatus(dseq, "PUT_OK", {
+                group_name: group.name,
+                put_attempts: 1,
+              }).catch((e) => cycleLog.warn("db.deployment.update.failed", { error: e.message }));
+            }
+            putStatus = "PUT_OK";
+            cycleLog.info("deployment.put.ok", { dseq, group: group.name });
+          } catch (err) {
+            cycleLog.error("deployment.put.failed", { dseq, group: group.name, error: err.message });
+            if (deploymentsRepoDep) {
+              await deploymentsRepoDep.updateStatus(dseq, "PUT_FAILED", {
+                group_name: group.name,
+                last_error: err.message,
+                put_attempts: 1,
+              }).catch((e) => cycleLog.warn("db.deployment.update.failed", { error: e.message }));
+            }
+            await groupsRepoDep.update(group.name, {
+              status: "PUT_FAILED",
+              last_error: err.message,
+            }).catch((e) => cycleLog.warn("db.group.update.failed", { error: e.message }));
+            if (notify.notifyPutFailed) {
+              await notify.notifyPutFailed(
+                { dseq, reason: err.message, group: group.name, account },
+                tg,
+              );
+            }
+            putStatus = "PUT_FAILED";
+          }
+        }
+
         await notify.notifyLeaseSuccess(
-          { bid: result.bid, lease: result.lease, account },
-          tgCfg(config, cycleLog),
+          { bid: result.bid, lease: result.lease, account, group: group?.name ?? null, putStatus },
+          tg,
         );
         cycleLog.info("cycle.hold", { ms: config.LEASE_HOLD_MS });
         await sleep(config.LEASE_HOLD_MS, abortSignal);
@@ -246,9 +351,22 @@ async function main() {
     blacklist: config.GPU_BLACKLIST,
   });
 
+  // DB pool first — accounts come from there, repos need it.
+  createPool(config);
+  try {
+    await dbPing();
+    logger.info("db.connected", { host: config.MYSQL_HOST, db: config.MYSQL_DATABASE });
+  } catch (err) {
+    logger.error("db.connect.failed", { error: err.message });
+    await notifyImpl.notifyFatal("DB Connect Failed", err, tgCfg(config, logger));
+    process.exit(1);
+  }
+
+  let sdlTemplate;
   let sdl;
   try {
-    sdl = await readFile(resolve(config.SDL_PATH), "utf8");
+    sdlTemplate = await sdlMod.loadTemplate(resolve(config.SDL_PATH));
+    sdl = sdlTemplate.raw;
   } catch (err) {
     logger.error("sdl.load.failed", { path: config.SDL_PATH, error: err.message });
     await notifyImpl.notifySdlFail(err, tgCfg(config, logger));
@@ -257,13 +375,13 @@ async function main() {
 
   let accounts;
   try {
-    accounts = await loadAccounts(resolve(config.ACCOUNTS_PATH));
+    accounts = await loadAccountsFromDb();
   } catch (err) {
     logger.error("accounts.load.failed", { error: err.message });
     await notifyImpl.notifyFatal("Accounts Load Failed", err, tgCfg(config, logger));
     process.exit(1);
   }
-  logger.info("accounts.loaded", { count: accounts.length });
+  logger.info("accounts.loaded", { count: accounts.length, source: "db" });
 
   const abortController = new AbortController();
   process.on("SIGINT", () => {
@@ -289,9 +407,24 @@ async function main() {
   });
 
   const deps = {
-    config, sdl, logger, notify: notifyImpl, akash: akashImpl,
+    config, sdl, sdlTemplate, logger, notify: notifyImpl, akash: akashImpl,
+    sdlMod, groupsRepo, deploymentsRepo,
     abortSignal: abortController.signal,
   };
+
+  startSweeper({
+    config, logger, notify: notifyImpl, groupsRepo, deploymentsRepo,
+    abortSignal: abortController.signal,
+  });
+
+  const apiServer = startApiServer({
+    config, logger, abortSignal: abortController.signal,
+  });
+  if (apiServer) {
+    abortController.signal.addEventListener("abort", () => {
+      apiServer.close(() => logger.info("api.closed", {}));
+    }, { once: true });
+  }
 
   while (!abortController.signal.aborted) {
     const loops = accounts.map((account) => runAccountLoop(account, deps));
@@ -314,6 +447,7 @@ async function main() {
     await sleep(cooloff, abortController.signal);
   }
 
+  await closePool().catch(() => {});
   await logger.drain().catch(() => {});
   process.exit(0);
 }

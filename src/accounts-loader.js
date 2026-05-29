@@ -3,6 +3,7 @@
 // proxy to null.
 
 import { readFile } from "node:fs/promises";
+import * as accountsRepo from "./db/repo/accounts.js";
 
 export async function loadAccounts(path) {
   let raw;
@@ -48,4 +49,25 @@ export async function loadAccounts(path) {
     out.push({ name, apiKey, proxy: normalizedProxy });
   });
   return out;
+}
+
+/**
+ * Load enabled accounts from the DB. Returns the same shape the loop expects
+ * (`{ id, name, apiKey, proxy, enabled }`). Throws if table is empty so the
+ * operator gets a clear hint instead of a silent no-op daemon.
+ */
+export async function loadAccountsFromDb() {
+  const rows = await accountsRepo.listEnabled();
+  if (rows.length === 0) {
+    throw new Error(
+      "accounts: table is empty — run 'npm run db:import-accounts' to seed it from accounts.json",
+    );
+  }
+  return rows.map((a) => ({
+    id: a.id,
+    name: a.name,
+    apiKey: a.apiKey,
+    proxy: a.proxy && a.proxy.trim() ? a.proxy.trim() : null,
+    enabled: a.enabled,
+  }));
 }

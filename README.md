@@ -27,6 +27,7 @@ Per cycle, per account:
 ## Requirements
 
 - Node.js 20 or later
+- A local MySQL (or compatible) running on `MYSQL_HOST:MYSQL_PORT` — state lives in `groups` / `accounts` / `deployments` tables
 - An Akash Console managed-wallet account (API key)
 - Optional HTTP proxy URL per account
 - Optional Telegram bot + chat ID for notifications
@@ -38,11 +39,49 @@ git clone <this repo>
 cd akash-bidding
 npm install
 
-cp .env.example .env             # fill in MAX_UACT_PER_BLOCK, telegram, etc.
+cp .env.example .env             # fill in MAX_UACT_PER_BLOCK, MYSQL_*, telegram, etc.
 cp accounts.example.json accounts.json   # populate name + apiKey + proxy per account
+
+# create DB once, then:
+npm run db:migrate                                  # applies src/db/migrations/001_init.sql
+npm run db:seed-groups -- --dir=/path/to/rpow2/data # scans dir → groups table (also accepts RPOW2_DATA_DIR env)
+npm run db:import-accounts                          # accounts.json → accounts table (one-shot, idempotent)
 ```
 
-Place your SDL at `./akash-deploy.yaml` (a working example is included).
+Place your SDL at `./akash-deploy.yaml` (a working example with `GROUP_NAME=__PLACEHOLDER__` is included; the daemon overwrites the placeholder per-lease via PUT).
+
+## Post-lease automation
+
+After lease success, each loop now:
+
+1. Inserts an audit row in `deployments` (`status=LEASED`, `expires_at=NOW+24h`).
+2. Locks the next AVAILABLE group via `SELECT ... FOR UPDATE` (race-safe across N concurrent loops).
+3. `PUT /v1/deployments/{dseq}` with the SDL template + the picked group's name injected into `GROUP_NAME=`.
+4. Flips deployment row → `PUT_OK` (or `PUT_FAILED` + Telegram alert + 30-min nag from sweeper).
+5. Background sweeper (every `SWEEP_INTERVAL_MS`, default 5 min) releases locks whose `expires_at < NOW()`.
+
+Zero SSH, zero `git checkout`, zero tmux required post-lease.
+
+## Admin API (loopback only)
+
+```
+GET    /health
+GET    /v1/groups[?status=AVAILABLE|LOCKED|PUT_FAILED|DISABLED]
+GET    /v1/groups/:name
+POST   /v1/groups              { name, branch, notes? }
+PUT    /v1/groups/:name        { status?, branch?, notes? }
+DELETE /v1/groups/:name
+POST   /v1/groups/:name/release    force-release lock
+GET    /v1/accounts[?enabled=true]
+GET    /v1/accounts/:id
+POST   /v1/accounts            { name, apiKey, proxy?, enabled? }
+PUT    /v1/accounts/:id
+DELETE /v1/accounts/:id
+GET    /v1/deployments[?account_id=&status=&limit=]
+GET    /v1/deployments/:dseq
+```
+
+Bound to `API_HOST=127.0.0.1` only. No auth — SSH-tunnel from outside if remote admin is required. See `docs/api-examples.md` for curl examples and `docs/group-management.md` for the PUT_FAILED runbook.
 
 ## Calibrate the price cap
 
@@ -102,34 +141,56 @@ JSONL, appended to `./logs/akash-bidding.log` and printed to stdout. Every cycle
 tail -f logs/akash-bidding.log | jq 'select(.event=="lease.success")'
 ```
 
-## Known limitations (v1)
+## Known limitations
 
-- No persistence — exhausted-state resets on restart; balance is re-checked from scratch.
-- Does not track / close leases after the 1h hold (Akash handles eviction when the deposit drains).
-- No SDL mutation; one fixed deployment shape per daemon.
+- Does not close leases via Akash API on expiry (deposit drains → auto-eviction).
+- Admin API is loopback + no auth — SSH-tunnel for remote admin.
 - Substring blacklist can over-match (e.g. `a10` matches `a100`); pick blacklist entries carefully.
 - No Telegram rate-limit throttling; acceptable at current N but revisit if N > 20 accounts.
+- A PUT failure burns 24h of trial credit silently aside from the 30-min Telegram nag. Operator must release the group manually via the admin API.
 
 ## Layout
 
 ```
 src/
   config.js              env loader, validates required keys
-  akash.js               REST client (per-call apiKey+proxy injection)
+  akash.js               REST client (per-call apiKey+proxy injection) + updateDeployment PUT
   bidder.js              pure filter + DESC-rank by uact/block
-  accounts-loader.js     accounts.json validator
-  notify.js              Telegram bot client + 5 typed notifiers
+  accounts-loader.js     JSON validator + loadAccountsFromDb()
+  notify.js              Telegram bot client + typed notifiers
   logger.js              JSONL file + stdout
   index.js               runAccountLoop + supervisor (Promise.allSettled)
+  sdl.js                 SDL template loader + GROUP_NAME injector
+  sweeper.js             background expiry + PUT_FAILED nag
+  db/
+    pool.js              mysql2 pool + query + withTx helpers
+    migrations/001_init.sql
+    repo/{groups,accounts,deployments}.js
+  api/
+    server.js            node:http on 127.0.0.1
+    router.js            method+regex matcher
+    json-body.js         parser + 100KB limit
+    routes/{groups,accounts,deployments,health}.js
 scripts/
   probe.js               one-shot live API probe
   check-proxy-ip.js      outbound IP per account
+  db-migrate.js          applies migrations/*.sql
+  db-seed-groups.js      rpow2/data → groups
+  db-import-accounts.js  accounts.json → accounts
 tests/
   bidder.test.js
   logger.test.js
   orchestrator-invariants.test.js
   orchestrator-concurrency.test.js
+  sdl.test.js
+  sweeper.test.js
+  notify-put-failed.test.js
+  api-validation.test.js
+  groups-repo-race.int.test.js   (gated by MYSQL_TEST_*)
   fixtures/bids-sample.json
-docs/run-and-ops.md
+docs/
+  run-and-ops.md
+  api-examples.md
+  group-management.md
 plans/                   design + phase docs
 ```

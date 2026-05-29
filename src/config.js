@@ -81,6 +81,19 @@ export function loadConfig() {
 
     TELEGRAM_BOT_TOKEN: str("TELEGRAM_BOT_TOKEN", ""),
     TELEGRAM_CHAT_ID: str("TELEGRAM_CHAT_ID", ""),
+
+    MYSQL_HOST: str("MYSQL_HOST", "127.0.0.1"),
+    MYSQL_PORT: int("MYSQL_PORT", 3306),
+    MYSQL_USER: str("MYSQL_USER", ""),
+    MYSQL_PASSWORD: str("MYSQL_PASSWORD", ""),
+    MYSQL_DATABASE: str("MYSQL_DATABASE", ""),
+
+    GROUP_LOCK_HOURS: int("GROUP_LOCK_HOURS", 24),
+    SWEEP_INTERVAL_MS: int("SWEEP_INTERVAL_MS", 300_000),
+    PUT_NAG_INTERVAL_MS: int("PUT_NAG_INTERVAL_MS", 1_800_000),
+
+    API_HOST: str("API_HOST", "127.0.0.1"),
+    API_PORT: int("API_PORT", 8088),
   };
 
   // MAX_USD_PER_HOUR takes precedence; falls back to MAX_UACT_PER_BLOCK for
@@ -99,6 +112,12 @@ export function loadConfig() {
   }
   if (!(config.DEPOSIT_USD > 0) || !(config.MIN_BALANCE_USD >= 0)) {
     throw new Error("config: DEPOSIT_USD must be > 0 and MIN_BALANCE_USD >= 0");
+  }
+  if (!config.MYSQL_USER || !config.MYSQL_DATABASE) {
+    throw new Error("config: MYSQL_USER and MYSQL_DATABASE are required");
+  }
+  if (!(config.GROUP_LOCK_HOURS > 0)) {
+    throw new Error("config: GROUP_LOCK_HOURS must be > 0");
   }
   return config;
 }

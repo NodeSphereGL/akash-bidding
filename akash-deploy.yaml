@@ -1,29 +1,25 @@
 ---
 version: "2.0"
 services:
-  service-11:
-    # Always use a version-pinned tag (NOT just :prod) — Akash nodes cache
-    # mutable tags, so reusing :prod can silently run an old image.
-    image: toanbk/rpow:prod_v2
+  service-rpow:
+    image: toanbk/rpow2:v1
     expose:
-      - port: 22
-        as: 22
+      - port: 80
+        as: 80
         to:
           - global: true
     env:
-      - >-
-        SSH_PUBKEY=ssh-ed25519
-        AAAAC3NzaC1lZDI1NTE5AAAAIMZMwH9szRt4NMNAsdR9sskpmfeuM4kHTMZKK/Cc1H4/
+      - GROUP_NAME=__PLACEHOLDER__
 profiles:
   compute:
-    service-11:
+    service-rpow:
       resources:
         cpu:
-          units: 1
+          units: 2
         memory:
-          size: 4Gi
+          size: 4gb
         storage:
-          - size: 30Gi
+          - size: 30gb
         gpu:
           units: 1
           attributes:
@@ -32,14 +28,11 @@ profiles:
   placement:
     dcloud:
       pricing:
-        service-11:
+        service-rpow:
           denom: uact
           amount: 100000
-      signedBy:
-        anyOf:
-          - akash1365yvmc4s7awdyj3n2sav7xfx76adc6dnmlx63
 deployment:
-  service-11:
+  service-rpow:
     dcloud:
-      profile: service-11
+      profile: service-rpow
       count: 1

@@ -175,6 +175,21 @@ export async function closeDeployment(ctx, dseq) {
 }
 
 /**
+ * PUT /v1/deployments/{dseq} with new SDL string. Used to inject GROUP_NAME
+ * post-lease so the deployed image picks the right group. Returns the
+ * unwrapped response body on success; throws AkashApiError on non-2xx.
+ */
+export async function updateDeployment(ctx, dseq, sdl) {
+  const body = await request(
+    ctx,
+    "PUT",
+    `/v1/deployments/${encodeURIComponent(dseq)}`,
+    { data: { sdl } },
+  );
+  return unwrap(body);
+}
+
+/**
  * Health check + key validation. Console-api has no balance endpoint; we
  * confirm the api-key works by listing deployments and rely on
  * insufficient-credit-at-create as the financial exhaustion signal.

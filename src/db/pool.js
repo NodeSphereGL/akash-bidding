@@ -1,0 +1,69 @@
+// mysql2/promise pool + helpers. Wraps driver errors in DbError so callers
+// don't import mysql2 directly.
+
+import mysql from "mysql2/promise";
+import { DbError } from "../errors.js";
+
+let _pool = null;
+
+export function createPool(config) {
+  if (_pool) return _pool;
+  _pool = mysql.createPool({
+    host: config.MYSQL_HOST,
+    port: config.MYSQL_PORT,
+    user: config.MYSQL_USER,
+    password: config.MYSQL_PASSWORD,
+    database: config.MYSQL_DATABASE,
+    waitForConnections: true,
+    connectionLimit: 5,
+    queueLimit: 0,
+    multipleStatements: false,
+    dateStrings: false,
+    timezone: "Z",
+  });
+  return _pool;
+}
+
+export function getPool() {
+  if (!_pool) throw new DbError("db.pool.not_initialized — call createPool(config) at boot");
+  return _pool;
+}
+
+export async function query(sql, params) {
+  const pool = getPool();
+  try {
+    const [rows] = await pool.query(sql, params);
+    return rows;
+  } catch (err) {
+    throw new DbError(`db.query.failed: ${err.message}`, err);
+  }
+}
+
+export async function withTx(fn) {
+  const pool = getPool();
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const result = await fn(conn);
+    await conn.commit();
+    return result;
+  } catch (err) {
+    try { await conn.rollback(); } catch { /* ignore */ }
+    if (err instanceof DbError) throw err;
+    throw new DbError(`db.tx.failed: ${err.message}`, err);
+  } finally {
+    conn.release();
+  }
+}
+
+export async function closePool() {
+  if (!_pool) return;
+  const p = _pool;
+  _pool = null;
+  try { await p.end(); } catch { /* ignore */ }
+}
+
+export async function ping() {
+  await query("SELECT 1");
+  return true;
+}

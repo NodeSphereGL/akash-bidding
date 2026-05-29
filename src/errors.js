@@ -29,3 +29,14 @@ export class AkashApiError extends Error {
   }
 }
 
+export class DbError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.name = "DbError";
+    if (cause) {
+      this.cause = cause;
+      this.code = cause.code;
+    }
+  }
+}
+
