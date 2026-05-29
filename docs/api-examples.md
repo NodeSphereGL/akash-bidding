@@ -90,9 +90,17 @@ curl -s http://127.0.0.1:8088/v1/deployments | jq
 curl -s 'http://127.0.0.1:8088/v1/deployments?status=PUT_FAILED' | jq
 curl -s 'http://127.0.0.1:8088/v1/deployments?account_id=2&limit=20' | jq
 
-# single
+# single (most recent row matching this dseq)
 curl -s http://127.0.0.1:8088/v1/deployments/123456 | jq
+
+# disambiguate when two accounts received the same dseq from console-api
+# (Akash dseqs are unique per owner, not globally — see migration 003)
+curl -s 'http://127.0.0.1:8088/v1/deployments/123456?account_id=4' | jq
 ```
+
+Response now also includes `autoTopUpDisabled: bool` — daemon sets this to
+`true` once the cost-guard PATCH (`/v2/deployment-settings/{dseq}`) succeeds.
+Sweeper retries the PATCH for any `PUT_OK` row where this stays `false`.
 
 ## Error envelope
 

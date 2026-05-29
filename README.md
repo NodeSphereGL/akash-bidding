@@ -54,13 +54,37 @@ Place your SDL at `./akash-deploy.yaml` (a working example with `GROUP_NAME=__PL
 
 After lease success, each loop now:
 
-1. Inserts an audit row in `deployments` (`status=LEASED`, `expires_at=NOW+24h`).
-2. Locks the next AVAILABLE group via `SELECT ... FOR UPDATE` (race-safe across N concurrent loops).
-3. `PUT /v1/deployments/{dseq}` with the SDL template + the picked group's name injected into `GROUP_NAME=`.
-4. Flips deployment row → `PUT_OK` (or `PUT_FAILED` + Telegram alert + 30-min nag from sweeper).
-5. Background sweeper (every `SWEEP_INTERVAL_MS`, default 5 min) releases locks whose `expires_at < NOW()`.
+1. **Atomic** (single mysql tx): inserts audit row in `deployments`
+   (`status=LEASED`, `expires_at=NOW+24h`) AND locks the next AVAILABLE group
+   via `SELECT ... FOR UPDATE`. Either both succeed or both roll back — no
+   orphan locked groups when the DB hiccups.
+2. `PUT /v1/deployments/{dseq}` with the SDL template + the picked group's
+   name injected into `GROUP_NAME=`.
+3. `PATCH /v2/deployment-settings/{dseq}` with `data.autoTopUpEnabled=false`
+   so console managed-wallet doesn't auto-refill escrow → deployment cleanly
+   evicts when deposit drains.
+4. Flips deployment row → `PUT_OK` (or `PUT_FAILED` + Telegram alert + 30-min
+   nag from sweeper). Sets `auto_topup_disabled=true` on success.
+5. Background sweeper (every `SWEEP_INTERVAL_MS`, default 5 min):
+   - releases locks whose `expires_at < NOW()`
+   - retries any PATCH that failed mid-cycle (escrow refill guard)
+   - fires `lease.orphan` Telegram alert if any active row stays
+     `auto_topup_disabled=false` for more than 1h
+
+If the on-chain lease succeeds but the post-lease tx fails (DB outage etc.),
+a `lease.orphan` Telegram alert fires with `account + dseq + error`. The
+daemon does **not** auto-close — operator triages via
+`scripts/ops/close-test-leases.js` and the console UI.
 
 Zero SSH, zero `git checkout`, zero tmux required post-lease.
+
+### Note on dseq uniqueness
+
+Akash dseqs are unique per owner, not globally. Two managed-wallet accounts
+can receive the same numeric dseq from console-api. Local schema reflects
+this via `UNIQUE (account_id, dseq)` (migration 003). Admin API
+`GET /v1/deployments/:dseq` returns the most recent matching row by default;
+add `?account_id=<id>` to disambiguate.
 
 ## Workspace scoping
 
@@ -145,6 +169,8 @@ Notifications fire on:
 | Event | Why |
 | --- | --- |
 | Lease acquired | Account landed a lease — that loop now sleeps 1h |
+| PUT failed | SDL update after lease failed; group is `PUT_FAILED`, nagged every 30 min until released |
+| Lease orphan | On-chain lease succeeded but post-lease tx failed — on-chain cost with no local row. Operator must close manually. Also fires if `auto_topup_disabled` stays false > 1h. |
 | All accounts depleted | Every per-account loop returned exhausted; supervisor cools off then respawns |
 | Account 401 | API key invalid for that account; that account's loop exits |
 | SDL load failed | Daemon exits before the loop |
@@ -173,17 +199,19 @@ tail -f logs/akash-bidding.log | jq 'select(.event=="lease.success")'
 ```
 src/
   config.js              env loader, validates required keys
-  akash.js               REST client (per-call apiKey+proxy injection) + updateDeployment PUT
+  akash.js               REST client + createDeployment / updateDeployment / disableAutoTopUp
   bidder.js              pure filter + DESC-rank by uact/block
   accounts-loader.js     JSON validator + loadAccountsFromDb()
-  notify.js              Telegram bot client + typed notifiers
+  notify.js              Telegram bot client + typed notifiers (incl. notifyLeaseOrphan)
   logger.js              JSONL file + stdout
   index.js               runAccountLoop + supervisor (Promise.allSettled)
+  post-lease.js          atomic insert + group-lock tx (rolls back together)
   sdl.js                 SDL template loader + GROUP_NAME injector
-  sweeper.js             background expiry + PUT_FAILED nag
+  sweeper.js             background expiry + PUT_FAILED nag + auto-topup retry
+  errors.js              AkashApiError, DbError, NoGroupAvailableError
   db/
     pool.js              mysql2 pool + query + withTx helpers
-    migrations/001_init.sql
+    migrations/{001..004}_*.sql
     repo/{groups,accounts,deployments}.js
   api/
     server.js            node:http on 127.0.0.1
@@ -196,6 +224,9 @@ scripts/
   db-migrate.js          applies migrations/*.sql
   db-seed-groups.js      rpow2/data → groups
   db-import-accounts.js  accounts.json → accounts
+  ops/
+    close-test-leases.js manually close (account, dseq) pairs + release group locks
+    test-auto-topup.js   smoke-test PATCH /v2/deployment-settings/{dseq}
 tests/
   bidder.test.js
   logger.test.js
@@ -203,8 +234,11 @@ tests/
   orchestrator-concurrency.test.js
   sdl.test.js
   sweeper.test.js
+  sweeper-auto-topup-retry.test.js
   notify-put-failed.test.js
   api-validation.test.js
+  post-lease-atomic.test.js
+  akash-disable-autotopup.test.js
   groups-repo-race.int.test.js   (gated by MYSQL_TEST_*)
   fixtures/bids-sample.json
 docs/

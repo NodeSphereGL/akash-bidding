@@ -32,6 +32,8 @@ import * as sdlMod from "./sdl.js";
 import * as groupsRepo from "./db/repo/groups.js";
 import * as deploymentsRepo from "./db/repo/deployments.js";
 import { createPool, closePool, ping as dbPing } from "./db/pool.js";
+import { postLeaseAtomic } from "./post-lease.js";
+import { NoGroupAvailableError } from "./errors.js";
 import { startSweeper } from "./sweeper.js";
 import { startApiServer } from "./api/server.js";
 
@@ -226,70 +228,71 @@ export async function runAccountLoop(account, deps) {
         const now = new Date();
         const expiresAt = addHours(now, config.GROUP_LOCK_HOURS);
 
-        // 1. record the lease as a deployments audit row (only when DB wired)
-        if (deploymentsRepoDep) {
+        // 1+2. Atomic: insert deployments row AND lock next group, or neither.
+        let group = null;
+        let putStatus = null;
+        const dbWired = !!(deploymentsRepoDep && groupsRepoDep);
+        if (dbWired) {
           try {
-            await deploymentsRepoDep.insert({
+            const r = await postLeaseAtomic({
+              db: { deploymentsRepo: deploymentsRepoDep, groupsRepo: groupsRepoDep },
               dseq,
-              accountId: account.id,
-              provider: result.bid?.provider ?? null,
-              uactPerBlock: result.bid?.uactPerBlock ?? null,
-              status: "LEASED",
-              leasedAt: now,
+              account,
+              leaseResult: result,
+              hours: config.GROUP_LOCK_HOURS,
+              now,
               expiresAt,
             });
+            group = r.group;
           } catch (err) {
-            cycleLog.error("db.deployment.insert.failed", { dseq, error: err.message });
+            if (err instanceof NoGroupAvailableError) {
+              cycleLog.warn("group.none-available", { dseq, workspace: account.workspace });
+              putStatus = "NO_GROUP";
+              if (notify.notifyPutFailed) {
+                await notify.notifyPutFailed(
+                  { dseq, reason: "no available group", group: null, account },
+                  tg,
+                );
+              }
+            } else {
+              // Lease succeeded on-chain but DB tx failed → no row, no lock.
+              // Operator must close the on-chain deployment manually.
+              cycleLog.error("lease.orphan", { dseq, account: account.name, error: err.message });
+              await notify.notifyLeaseOrphan({ account, dseq, error: err.message }, tg);
+              putStatus = "ORPHAN";
+            }
           }
         }
 
-        // 2. lock next available group (only when DB wired)
-        let group = null;
-        if (groupsRepoDep) {
-          try {
-            group = await groupsRepoDep.lockNextAvailable(account.id, dseq, config.GROUP_LOCK_HOURS, account.workspace);
-          } catch (err) {
-            cycleLog.error("db.group.lock.failed", { dseq, error: err.message });
-          }
-        }
-
-        let putStatus = groupsRepoDep ? "SKIPPED" : null;
-        if (groupsRepoDep && !group) {
-          cycleLog.warn("group.none-available", { dseq, workspace: account.workspace });
-          if (deploymentsRepoDep) {
-            await deploymentsRepoDep.updateStatus(dseq, "PUT_FAILED", {
-              last_error: "no available group",
-            }).catch((e) => cycleLog.warn("db.deployment.update.failed", { error: e.message }));
-          }
-          if (notify.notifyPutFailed) {
-            await notify.notifyPutFailed(
-              { dseq, reason: "no available group", group: null, account },
-              tg,
-            );
-          }
-          putStatus = "NO_GROUP";
-        } else if (group && sdlTemplate && sdlInjector) {
-          // 3. inject GROUP_NAME and PUT new SDL
+        // 3. inject GROUP_NAME and PUT new SDL (only when we own a group)
+        if (group && sdlTemplate && sdlInjector) {
           try {
             const newSdl = sdlInjector.injectGroupName(sdlTemplate, group.name);
             await akash.updateDeployment({ account, config, logger: cycleLog }, dseq, newSdl);
-            if (deploymentsRepoDep) {
-              await deploymentsRepoDep.updateStatus(dseq, "PUT_OK", {
-                group_name: group.name,
-                put_attempts: 1,
-              }).catch((e) => cycleLog.warn("db.deployment.update.failed", { error: e.message }));
-            }
+            await deploymentsRepoDep.updateStatus(dseq, account.id, "PUT_OK", {
+              group_name: group.name,
+              put_attempts: 1,
+            }).catch((e) => cycleLog.warn("db.deployment.update.failed", { error: e.message }));
             putStatus = "PUT_OK";
             cycleLog.info("deployment.put.ok", { dseq, group: group.name });
+
+            // 4. Disable console managed-wallet auto-topup. Cost guard.
+            // Non-fatal: if PATCH fails, sweeper retries on its tick.
+            try {
+              await akash.disableAutoTopUp({ account, config, logger: cycleLog }, dseq);
+              await deploymentsRepoDep.markAutoTopUpDisabled(dseq, account.id)
+                .catch((e) => cycleLog.warn("db.deployment.update.failed", { error: e.message }));
+              cycleLog.info("deployment.auto_topup.disabled", { dseq });
+            } catch (err) {
+              cycleLog.warn("deployment.auto_topup.disable.failed", { dseq, error: err.message });
+            }
           } catch (err) {
             cycleLog.error("deployment.put.failed", { dseq, group: group.name, error: err.message });
-            if (deploymentsRepoDep) {
-              await deploymentsRepoDep.updateStatus(dseq, "PUT_FAILED", {
-                group_name: group.name,
-                last_error: err.message,
-                put_attempts: 1,
-              }).catch((e) => cycleLog.warn("db.deployment.update.failed", { error: e.message }));
-            }
+            await deploymentsRepoDep.updateStatus(dseq, account.id, "PUT_FAILED", {
+              group_name: group.name,
+              last_error: err.message,
+              put_attempts: 1,
+            }).catch((e) => cycleLog.warn("db.deployment.update.failed", { error: e.message }));
             await groupsRepoDep.update(group.name, {
               status: "PUT_FAILED",
               last_error: err.message,
@@ -414,6 +417,7 @@ async function main() {
 
   startSweeper({
     config, logger, notify: notifyImpl, groupsRepo, deploymentsRepo,
+    accounts, akash: akashImpl,
     abortSignal: abortController.signal,
   });
 

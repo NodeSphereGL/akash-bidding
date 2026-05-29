@@ -40,3 +40,11 @@ export class DbError extends Error {
   }
 }
 
+export class NoGroupAvailableError extends Error {
+  constructor(workspace) {
+    super(`no available group in workspace "${workspace}"`);
+    this.name = "NoGroupAvailableError";
+    this.workspace = workspace;
+  }
+}
+

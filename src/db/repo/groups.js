@@ -59,27 +59,29 @@ export async function remove(name) {
 
 /**
  * Atomic pick-next-available. Sequential ASC by name. Returns locked row or null.
+ * If `conn` is provided, runs inside that transaction (no nested withTx).
  */
-export async function lockNextAvailable(accountId, dseq, lockHours, workspace) {
-  return withTx(async (conn) => {
-    const [rows] = await conn.query(
+export async function lockNextAvailable(accountId, dseq, lockHours, workspace, conn) {
+  const run = async (c) => {
+    const [rows] = await c.query(
       "SELECT name FROM `groups` WHERE status = 'AVAILABLE' AND workspace = ? ORDER BY name ASC LIMIT 1 FOR UPDATE",
       [workspace ?? "DEFAULT"],
     );
     if (rows.length === 0) return null;
     const name = rows[0].name;
-    await conn.query(
+    await c.query(
       `UPDATE \`groups\` SET status = 'LOCKED', locked_by_account_id = ?, locked_dseq = ?,
          locked_at = NOW(), expires_at = DATE_ADD(NOW(), INTERVAL ? HOUR), last_error = NULL
        WHERE name = ?`,
       [accountId, dseq, lockHours, name],
     );
-    const [updated] = await conn.query(
+    const [updated] = await c.query(
       `SELECT ${COLS} FROM \`groups\` WHERE name = ?`,
       [name],
     );
     return updated[0] ?? null;
-  });
+  };
+  return conn ? run(conn) : withTx(run);
 }
 
 export async function release(name) {

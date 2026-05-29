@@ -91,8 +91,33 @@ curl -s -X POST http://127.0.0.1:8088/v1/groups \
 - Releases LOCKED rows whose `expires_at < NOW()`.
 - Marks deployments LEASED/PUT_OK → EXPIRED when their `expires_at < NOW()`.
 - Telegram-nags PUT_FAILED rows every `PUT_NAG_INTERVAL_MS` (default 30 min).
+- Retries `PATCH /v2/deployment-settings/{dseq}` (auto-topup disable) for any
+  active deployment row where `auto_topup_disabled=FALSE`. If the same dseq
+  keeps failing for more than 1 hour past `leased_at`, fires a one-shot
+  `notifyLeaseOrphan` Telegram alert (escrow may refill if not fixed).
 - One sweeper exception does not kill the timer — next tick proceeds.
 - `notifySweepRelease` only fires when 3+ groups are released in a single tick (avoids nightly-mass-release spam).
+
+## Lease orphan
+
+A `lease.orphan` event fires when the on-chain lease succeeds but the local
+post-lease transaction (insert deployment row + lock next group) rolls back —
+e.g. DB outage mid-cycle. The lease keeps accruing cost on Akash with no local
+audit row. Sweeper does **not** auto-close it; the operator must close it
+manually so the root cause stays visible.
+
+Triage:
+
+1. Read the Telegram alert — it contains `account` + `dseq` + the error.
+2. Confirm the on-chain lease is live: `GET /v1/deployments?account_id=<id>` on
+   console-api (or the console UI).
+3. Close it:
+   ```bash
+   # edit TARGETS at the top of the file, then:
+   node scripts/ops/close-test-leases.js
+   ```
+   Or via the console UI's "Close" button.
+4. Fix the underlying cause (DB, schema, race) before restarting the daemon.
 
 ## Workspace scoping
 

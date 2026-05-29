@@ -190,6 +190,23 @@ export async function updateDeployment(ctx, dseq, sdl) {
 }
 
 /**
+ * PATCH /v2/deployment-settings/{dseq} to disable auto-topup. Without this
+ * the console managed-wallet auto-refills escrow when it drains → cost
+ * accrues forever. We want a one-way trip: lease → run → drain → evict.
+ * Throws AkashApiError on non-2xx; caller decides whether to mark
+ * `auto_topup_disabled` or schedule a sweeper retry.
+ */
+export async function disableAutoTopUp(ctx, dseq) {
+  const body = await request(
+    ctx,
+    "PATCH",
+    `/v2/deployment-settings/${encodeURIComponent(dseq)}`,
+    { data: { autoTopUpEnabled: false } },
+  );
+  return unwrap(body);
+}
+
+/**
  * Health check + key validation. Console-api has no balance endpoint; we
  * confirm the api-key works by listing deployments and rely on
  * insufficient-credit-at-create as the financial exhaustion signal.

@@ -105,6 +105,21 @@ export async function notifyPutFailedNag(group, cfg) {
   return sendTelegram(msg, cfg);
 }
 
+export async function notifyLeaseOrphan({ account, dseq, error }, cfg) {
+  const msg = [
+    "🛑 <b>LEASE ORPHAN — chain lease succeeded but DB tx failed</b>",
+    `<code>${new Date().toISOString()}</code>`,
+    "",
+    `Account: <b>${htmlEscape(account?.name ?? "?")}</b>`,
+    `dseq: <code>${htmlEscape(dseq ?? "?")}</code>`,
+    `Error: ${htmlEscape(error ?? "unknown")}`,
+    "",
+    "Akash is accruing cost on this deployment with no local record.",
+    "Action: close via console UI or scripts/ops/close-test-leases.js.",
+  ].join("\n");
+  return sendTelegram(msg, cfg);
+}
+
 export async function notifySweepRelease(count, cfg) {
   return sendTelegram(`🧹 Sweeper released ${Number(count) || 0} group lock(s).`, cfg);
 }
