@@ -4,6 +4,7 @@
 
 import { readFile } from "node:fs/promises";
 import * as accountsRepo from "./db/repo/accounts.js";
+import { isValidWorkspace } from "./workspace-validator.js";
 
 export async function loadAccounts(path) {
   let raw;
@@ -33,7 +34,7 @@ export async function loadAccounts(path) {
     if (!entry || typeof entry !== "object") {
       throw new Error(`accounts[${idx}]: must be an object`);
     }
-    const { name, apiKey, proxy } = entry;
+    const { name, apiKey, proxy, workspace } = entry;
     if (typeof name !== "string" || name.length === 0) {
       throw new Error(`accounts[${idx}]: missing or empty name`);
     }
@@ -46,7 +47,20 @@ export async function loadAccounts(path) {
     seen.add(name);
     const normalizedProxy =
       typeof proxy === "string" && proxy.trim().length > 0 ? proxy.trim() : null;
-    out.push({ name, apiKey, proxy: normalizedProxy });
+    let normalizedWorkspace;
+    if (workspace != null) {
+      const ws = typeof workspace === "string" ? workspace.trim() : "";
+      if (ws.length === 0) {
+        normalizedWorkspace = undefined;
+      } else if (!isValidWorkspace(ws)) {
+        throw new Error(
+          `accounts[${idx}] (${name}): invalid workspace "${ws}" — must match /^[a-z0-9_-]+$/i, max 64 chars`,
+        );
+      } else {
+        normalizedWorkspace = ws;
+      }
+    }
+    out.push({ name, apiKey, proxy: normalizedProxy, workspace: normalizedWorkspace });
   });
   return out;
 }
@@ -69,5 +83,6 @@ export async function loadAccountsFromDb() {
     apiKey: a.apiKey,
     proxy: a.proxy && a.proxy.trim() ? a.proxy.trim() : null,
     enabled: a.enabled,
+    workspace: a.workspace ?? "DEFAULT",
   }));
 }

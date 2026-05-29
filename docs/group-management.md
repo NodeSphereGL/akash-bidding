@@ -94,6 +94,40 @@ curl -s -X POST http://127.0.0.1:8088/v1/groups \
 - One sweeper exception does not kill the timer — next tick proceeds.
 - `notifySweepRelease` only fires when 3+ groups are released in a single tick (avoids nightly-mass-release spam).
 
+## Workspace scoping
+
+Each account and each group has a `workspace` column (`VARCHAR(64)`, default
+`'DEFAULT'`). At lock-time `lockNextAvailable` requires strict equality:
+`account.workspace = group.workspace`. A `DEFAULT` account will never pick up
+a `validator247` group and vice versa.
+
+Fresh installs land entirely on `'DEFAULT'` → single-pool behaviour. To
+partition (e.g. dedicate v247 groups to one account):
+
+```bash
+# tag the account
+curl -s -X PUT http://127.0.0.1:8088/v1/accounts/<id> \
+  -H 'Content-Type: application/json' \
+  -d '{"workspace":"validator247"}'
+
+# tag each v247 group
+for g in v247_group_01 v247_group_02 v247_group_03; do
+  curl -s -X PUT http://127.0.0.1:8088/v1/groups/$g \
+    -H 'Content-Type: application/json' \
+    -d '{"workspace":"validator247"}'
+done
+
+# verify partitioning
+curl -s 'http://127.0.0.1:8088/v1/groups?workspace=validator247' | jq '.[].name'
+```
+
+Notes:
+- Workspace values: 1-64 chars, regex `/^[a-z0-9_-]+$/i`. Empty or invalid → 400.
+- Re-tagging a `LOCKED` group is allowed; it takes effect on the next lock cycle.
+- **Footgun**: if you re-tag the account but forget the matching groups (or vice
+  versa), the loop hits `group.none-available` and Telegram nags. Always re-tag
+  both sides in the same change window.
+
 ## Backups
 
 `accounts.json` is kept as a backup even after `db:import-accounts`. The DB is

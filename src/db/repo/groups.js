@@ -4,12 +4,13 @@
 import { query, withTx } from "../pool.js";
 import { DbError } from "../../errors.js";
 
-const COLS = "name, branch, status, locked_by_account_id, locked_dseq, locked_at, expires_at, last_nag_at, last_error, notes, created_at, updated_at";
+const COLS = "name, branch, workspace, status, locked_by_account_id, locked_dseq, locked_at, expires_at, last_nag_at, last_error, notes, created_at, updated_at";
 
-export async function listAll({ status, limit } = {}) {
+export async function listAll({ status, workspace, limit } = {}) {
   const where = [];
   const params = [];
   if (status) { where.push("status = ?"); params.push(status); }
+  if (workspace) { where.push("workspace = ?"); params.push(workspace); }
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
   const limitSql = limit ? `LIMIT ${Number(limit)}` : "";
   return query(`SELECT ${COLS} FROM \`groups\` ${whereSql} ORDER BY name ASC ${limitSql}`, params);
@@ -20,11 +21,11 @@ export async function get(name) {
   return rows[0] ?? null;
 }
 
-export async function insert({ name, branch, status, notes }) {
+export async function insert({ name, branch, status, notes, workspace }) {
   try {
     await query(
-      "INSERT INTO `groups` (name, branch, status, notes) VALUES (?, ?, ?, ?)",
-      [name, branch, status ?? "AVAILABLE", notes ?? null],
+      "INSERT INTO `groups` (name, branch, status, notes, workspace) VALUES (?, ?, ?, ?, ?)",
+      [name, branch, status ?? "AVAILABLE", notes ?? null, workspace ?? "DEFAULT"],
     );
   } catch (err) {
     if (err instanceof DbError && err.code === "ER_DUP_ENTRY") {
@@ -36,7 +37,7 @@ export async function insert({ name, branch, status, notes }) {
 }
 
 export async function update(name, patch) {
-  const allowed = ["status", "branch", "notes", "locked_by_account_id", "locked_dseq", "locked_at", "expires_at", "last_nag_at", "last_error"];
+  const allowed = ["status", "branch", "notes", "workspace", "locked_by_account_id", "locked_dseq", "locked_at", "expires_at", "last_nag_at", "last_error"];
   const sets = [];
   const params = [];
   for (const key of allowed) {
@@ -59,10 +60,11 @@ export async function remove(name) {
 /**
  * Atomic pick-next-available. Sequential ASC by name. Returns locked row or null.
  */
-export async function lockNextAvailable(accountId, dseq, lockHours) {
+export async function lockNextAvailable(accountId, dseq, lockHours, workspace) {
   return withTx(async (conn) => {
     const [rows] = await conn.query(
-      "SELECT name FROM `groups` WHERE status = 'AVAILABLE' ORDER BY name ASC LIMIT 1 FOR UPDATE",
+      "SELECT name FROM `groups` WHERE status = 'AVAILABLE' AND workspace = ? ORDER BY name ASC LIMIT 1 FOR UPDATE",
+      [workspace ?? "DEFAULT"],
     );
     if (rows.length === 0) return null;
     const name = rows[0].name;

@@ -26,7 +26,7 @@ async function main() {
     const existing = await accountsRepo.getByName(a.name);
     if (existing) { skipped++; continue; }
     if (dryRun) { inserted++; continue; }
-    await accountsRepo.insert({ name: a.name, apiKey: a.apiKey, proxy: a.proxy, enabled: true });
+    await accountsRepo.insert({ name: a.name, apiKey: a.apiKey, proxy: a.proxy, enabled: true, workspace: a.workspace });
     inserted++;
   }
 

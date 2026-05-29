@@ -4,7 +4,7 @@
 import { query } from "../pool.js";
 import { DbError } from "../../errors.js";
 
-const COLS = "id, name, api_key, proxy, enabled, created_at, updated_at";
+const COLS = "id, name, api_key, proxy, workspace, enabled, created_at, updated_at";
 
 function toCamel(row) {
   if (!row) return null;
@@ -13,6 +13,7 @@ function toCamel(row) {
     name: row.name,
     apiKey: row.api_key,
     proxy: row.proxy,
+    workspace: row.workspace,
     enabled: !!row.enabled,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -39,11 +40,11 @@ export async function getByName(name) {
   return toCamel(rows[0]);
 }
 
-export async function insert({ name, apiKey, proxy, enabled }) {
+export async function insert({ name, apiKey, proxy, enabled, workspace }) {
   try {
     const result = await query(
-      "INSERT INTO accounts (name, api_key, proxy, enabled) VALUES (?, ?, ?, ?)",
-      [name, apiKey, proxy ?? null, enabled === false ? 0 : 1],
+      "INSERT INTO accounts (name, api_key, proxy, enabled, workspace) VALUES (?, ?, ?, ?, ?)",
+      [name, apiKey, proxy ?? null, enabled === false ? 0 : 1, workspace ?? "DEFAULT"],
     );
     return get(result.insertId);
   } catch (err) {
@@ -55,7 +56,7 @@ export async function insert({ name, apiKey, proxy, enabled }) {
 }
 
 export async function update(id, patch) {
-  const map = { name: "name", apiKey: "api_key", proxy: "proxy", enabled: "enabled" };
+  const map = { name: "name", apiKey: "api_key", proxy: "proxy", enabled: "enabled", workspace: "workspace" };
   const sets = [];
   const params = [];
   for (const [k, col] of Object.entries(map)) {

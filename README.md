@@ -62,20 +62,39 @@ After lease success, each loop now:
 
 Zero SSH, zero `git checkout`, zero tmux required post-lease.
 
+## Workspace scoping
+
+Each account and each group carry a `workspace` column (`VARCHAR(64)`, default
+`'DEFAULT'`). At lock-time the daemon picks only groups whose `workspace`
+equals the account's `workspace` (strict equality). Fresh installs land on
+`'DEFAULT'` everywhere → single-pool behaviour, no change vs. legacy.
+
+To partition (e.g. dedicate `v247_*` groups to one account):
+
+```bash
+curl -s -X PUT http://127.0.0.1:8088/v1/accounts/<id> \
+  -H 'Content-Type: application/json' -d '{"workspace":"validator247"}'
+curl -s -X PUT http://127.0.0.1:8088/v1/groups/v247_group_01 \
+  -H 'Content-Type: application/json' -d '{"workspace":"validator247"}'
+```
+
+Workspace values: 1-64 chars, regex `/^[a-z0-9_-]+$/i`. See
+`docs/group-management.md` for the re-tag workflow and footguns.
+
 ## Admin API (loopback only)
 
 ```
 GET    /health
-GET    /v1/groups[?status=AVAILABLE|LOCKED|PUT_FAILED|DISABLED]
+GET    /v1/groups[?status=AVAILABLE|LOCKED|PUT_FAILED|DISABLED][&workspace=NAME]
 GET    /v1/groups/:name
-POST   /v1/groups              { name, branch, notes? }
-PUT    /v1/groups/:name        { status?, branch?, notes? }
+POST   /v1/groups              { name, branch, notes?, workspace? }
+PUT    /v1/groups/:name        { status?, branch?, notes?, workspace? }
 DELETE /v1/groups/:name
 POST   /v1/groups/:name/release    force-release lock
 GET    /v1/accounts[?enabled=true]
 GET    /v1/accounts/:id
-POST   /v1/accounts            { name, apiKey, proxy?, enabled? }
-PUT    /v1/accounts/:id
+POST   /v1/accounts            { name, apiKey, proxy?, enabled?, workspace? }
+PUT    /v1/accounts/:id         { name?, apiKey?, proxy?, enabled?, workspace? }
 DELETE /v1/accounts/:id
 GET    /v1/deployments[?account_id=&status=&limit=]
 GET    /v1/deployments/:dseq

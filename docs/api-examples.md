@@ -26,6 +26,15 @@ curl -s http://127.0.0.1:8088/v1/groups | jq
 curl -s 'http://127.0.0.1:8088/v1/groups?status=AVAILABLE' | jq
 curl -s 'http://127.0.0.1:8088/v1/groups?status=PUT_FAILED' | jq
 
+# filter by workspace
+curl -s 'http://127.0.0.1:8088/v1/groups?workspace=validator247' | jq
+curl -s 'http://127.0.0.1:8088/v1/groups?workspace=DEFAULT&status=AVAILABLE' | jq
+
+# re-tag a group's workspace (takes effect next lock cycle even if currently LOCKED)
+curl -s -X PUT http://127.0.0.1:8088/v1/groups/v247_group_01 \
+  -H 'Content-Type: application/json' \
+  -d '{"workspace":"validator247"}'
+
 # single
 curl -s http://127.0.0.1:8088/v1/groups/group_01_vast_ai | jq
 
@@ -55,15 +64,20 @@ curl -s 'http://127.0.0.1:8088/v1/accounts?enabled=true' | jq
 # single (includes apiKey — loopback only!)
 curl -s http://127.0.0.1:8088/v1/accounts/1 | jq
 
-# add account
+# add account (workspace optional; defaults to "DEFAULT")
 curl -s -X POST http://127.0.0.1:8088/v1/accounts \
   -H 'Content-Type: application/json' \
-  -d '{"name":"alpha","apiKey":"sk_xxx","proxy":"http://user:pass@host:port","enabled":true}'
+  -d '{"name":"alpha","apiKey":"sk_xxx","proxy":"http://user:pass@host:port","enabled":true,"workspace":"validator247"}'
 
 # disable
 curl -s -X PUT http://127.0.0.1:8088/v1/accounts/3 \
   -H 'Content-Type: application/json' \
   -d '{"enabled":false}'
+
+# move account to a different workspace
+curl -s -X PUT http://127.0.0.1:8088/v1/accounts/3 \
+  -H 'Content-Type: application/json' \
+  -d '{"workspace":"validator247"}'
 ```
 
 ## Deployments (audit log)

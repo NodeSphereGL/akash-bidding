@@ -5,6 +5,7 @@
 import * as accountsRepo from "../../db/repo/accounts.js";
 import { sendJson, sendError, HttpError } from "../json-body.js";
 import { DbError } from "../../errors.js";
+import { isValidWorkspace } from "../../workspace-validator.js";
 
 function toJson(a, { includeApiKey } = {}) {
   if (!a) return a;
@@ -12,6 +13,7 @@ function toJson(a, { includeApiKey } = {}) {
     id: a.id,
     name: a.name,
     proxy: a.proxy,
+    workspace: a.workspace,
     enabled: a.enabled,
     createdAt: a.createdAt,
     updatedAt: a.updatedAt,
@@ -40,12 +42,16 @@ export async function create(req, res, { body }) {
   if (!body || typeof body !== "object") throw new HttpError(400, "VALIDATION", "body required");
   if (!body.name || typeof body.name !== "string") throw new HttpError(400, "VALIDATION", "name required");
   if (!body.apiKey || typeof body.apiKey !== "string") throw new HttpError(400, "VALIDATION", "apiKey required");
+  if (body.workspace != null && !isValidWorkspace(body.workspace)) {
+    throw new HttpError(400, "VALIDATION", "invalid workspace");
+  }
   try {
     const row = await accountsRepo.insert({
       name: body.name,
       apiKey: body.apiKey,
       proxy: body.proxy ?? null,
       enabled: body.enabled !== false,
+      workspace: body.workspace,
     });
     sendJson(res, 201, toJson(row, { includeApiKey: true }));
   } catch (err) {
@@ -62,8 +68,11 @@ export async function update(req, res, { params, body }) {
   if (!body || typeof body !== "object") throw new HttpError(400, "VALIDATION", "body required");
   const existing = await accountsRepo.get(id);
   if (!existing) return sendError(res, 404, "NOT_FOUND", `account ${id} not found`);
+  if (body.workspace != null && !isValidWorkspace(body.workspace)) {
+    throw new HttpError(400, "VALIDATION", "invalid workspace");
+  }
   const patch = {};
-  for (const k of ["name", "apiKey", "proxy", "enabled"]) {
+  for (const k of ["name", "apiKey", "proxy", "enabled", "workspace"]) {
     if (k in body) patch[k] = body[k];
   }
   const row = await accountsRepo.update(id, patch);

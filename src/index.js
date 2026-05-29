@@ -152,7 +152,7 @@ export async function runAccountLoop(account, deps) {
   const groupsRepoDep = deps.groupsRepo;
   const deploymentsRepoDep = deps.deploymentsRepo;
   const loopLog = logger.child({ account: account.name });
-  loopLog.info("account.loop.start", {});
+  loopLog.info("account.loop.start", { workspace: account.workspace });
 
   const jitterMs = randomBetween(0, config.STARTUP_JITTER_MS);
   await sleep(jitterMs, abortSignal);
@@ -247,7 +247,7 @@ export async function runAccountLoop(account, deps) {
         let group = null;
         if (groupsRepoDep) {
           try {
-            group = await groupsRepoDep.lockNextAvailable(account.id, dseq, config.GROUP_LOCK_HOURS);
+            group = await groupsRepoDep.lockNextAvailable(account.id, dseq, config.GROUP_LOCK_HOURS, account.workspace);
           } catch (err) {
             cycleLog.error("db.group.lock.failed", { dseq, error: err.message });
           }
@@ -255,7 +255,7 @@ export async function runAccountLoop(account, deps) {
 
         let putStatus = groupsRepoDep ? "SKIPPED" : null;
         if (groupsRepoDep && !group) {
-          cycleLog.warn("group.none-available", { dseq });
+          cycleLog.warn("group.none-available", { dseq, workspace: account.workspace });
           if (deploymentsRepoDep) {
             await deploymentsRepoDep.updateStatus(dseq, "PUT_FAILED", {
               last_error: "no available group",

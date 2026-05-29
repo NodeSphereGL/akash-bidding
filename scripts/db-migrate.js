@@ -37,8 +37,17 @@ async function main() {
     const sql = await readFile(path, "utf8");
     const stmts = splitStatements(sql);
     console.log(`[migrate] applying ${file} (${stmts.length} stmt(s))`);
-    for (const stmt of stmts) {
-      await pool.query(stmt);
+    // Bind every statement in the file to a single connection so that
+    // session-scoped artifacts (user variables, PREPARE/EXECUTE) survive
+    // across multiple .query() calls instead of randomly hitting different
+    // pool connections.
+    const conn = await pool.getConnection();
+    try {
+      for (const stmt of stmts) {
+        await conn.query(stmt);
+      }
+    } finally {
+      conn.release();
     }
   }
   console.log("[migrate] done");
