@@ -25,11 +25,14 @@ const CONCURRENCY = 4;
 const LATEST_BLOCK_PATH = "/rest/cosmos/base/tendermint/v1beta1/blocks/latest";
 
 function parseArgs(argv) {
-  const out = { dryRun: false, account: null, limit: 500 };
+  // `limit` is the page size for /v1/deployments?skip=&limit= — the script
+  // paginates until pagination.hasMore is false, so this is just a per-page
+  // tuning knob, not a hard cap on what we sync.
+  const out = { dryRun: false, account: null, limit: 1000 };
   for (const a of argv) {
     if (a === "--dry-run") out.dryRun = true;
     else if (a.startsWith("--account=")) out.account = a.slice("--account=".length);
-    else if (a.startsWith("--limit=")) out.limit = Number(a.slice("--limit=".length)) || 500;
+    else if (a.startsWith("--limit=")) out.limit = Number(a.slice("--limit=".length)) || 1000;
     else console.warn(`[sync-live] ignoring unknown arg: ${a}`);
   }
   return out;
@@ -108,10 +111,27 @@ async function fetchChainAnchor(config) {
   }
 }
 
-async function listLive(ctx, limit) {
-  const body = await akashRequest(ctx, "GET", `/v1/deployments?limit=${limit}`);
-  const data = unwrap(body);
-  return Array.isArray(data?.deployments) ? data.deployments : [];
+// Paginate through ALL deployments using the documented skip+limit
+// parameters. Console-api returns a mix of active/closed in arbitrary order;
+// stopping at the first page (the previous behavior) silently drops active
+// rows when a wallet has more historical rows than `pageSize`. Loop until
+// pagination.hasMore === false (or a hard ceiling, as a safety stop).
+async function listLive(ctx, pageSize) {
+  const HARD_CEILING_PAGES = 20; // 20 * pageSize rows max — prevents infinite loop on broken API
+  const out = [];
+  let skip = 0;
+  for (let page = 0; page < HARD_CEILING_PAGES; page++) {
+    const body = await akashRequest(ctx, "GET", `/v1/deployments?skip=${skip}&limit=${pageSize}`);
+    const data = unwrap(body);
+    const rows = Array.isArray(data?.deployments) ? data.deployments : [];
+    out.push(...rows);
+    const hasMore = data?.pagination?.hasMore === true;
+    const total = Number(data?.pagination?.total ?? 0);
+    if (!hasMore || rows.length === 0) break;
+    skip += rows.length;
+    if (total > 0 && skip >= total) break;
+  }
+  return out;
 }
 
 async function upsertDeployment({ accountId, dseq, provider, leasedAt, expiresAt }) {
@@ -156,7 +176,6 @@ async function syncAccount(account, config, anchor, { dryRun, limit }) {
   stats.fetched = live.length;
 
   const lockHoursMs = config.GROUP_LOCK_HOURS * 3600 * 1000;
-  const truncated = live.length >= limit;
 
   for (const d of live) {
     if (!isActive(d)) continue;
@@ -197,11 +216,6 @@ async function syncAccount(account, config, anchor, { dryRun, limit }) {
     // 0 = row existed but no field actually changed; not counted.
   }
 
-  if (truncated) {
-    console.warn(
-      `[sync-live] ${account.name}: returned ${live.length} rows == limit=${limit}; bump --limit to be sure nothing was clipped`,
-    );
-  }
   return stats;
 }
 
