@@ -8,7 +8,8 @@
 // dedupe by (owner, dseq) and keep ONE canonical row (lowest account.id).
 //
 // Pipeline:
-//   1. Per-account fetch (parallel, paginated).
+//   1. Per-account fetch (sequential — "await each, like PHP" per operator
+//      preference; the full pass finishes in a few seconds anyway).
 //   2. Normalize rows; drop ones without a lease (nothing for the daemon to
 //      manage yet — bidder will pick those up).
 //   3. Dedupe by (owner, dseq) — lowest account.id wins as canonical.
