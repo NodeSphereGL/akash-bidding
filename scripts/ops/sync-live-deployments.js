@@ -1,19 +1,27 @@
 #!/usr/bin/env node
 // Reconcile live console-api deployment state into the local `deployments`
-// table. Per-account fetch + simple upsert.
+// table.
 //
-// Filter: only deployments with a non-empty `leases` array — a deployment
-// without a lease is not consuming a managed-wallet position and there's
-// nothing for the daemon to manage. The bidder will pick those up in its
-// normal cycle.
+// Why this is more than "loop accounts + upsert": console-api api-keys are
+// frequently shared-wallet — N keys all see the same wallet's deployments.
+// A naive per-account upsert produces N rows per logical deployment. We
+// dedupe by (owner, dseq) and keep ONE canonical row (lowest account.id).
 //
-// Uniqueness: (account_id, dseq) — the schema's existing UNIQUE key. If two
-// api-keys see the same wallet's deployment, each gets its own row. That's
-// by design: each row represents "this api-key can manage this deployment".
+// Pipeline:
+//   1. Per-account fetch (parallel, paginated).
+//   2. Normalize rows; drop ones without a lease (nothing for the daemon to
+//      manage yet — bidder will pick those up).
+//   3. Dedupe by (owner, dseq) — lowest account.id wins as canonical.
+//   4. Upsert canonical row + delete non-canonical LEASED rows.
+//   5. Two-way reconcile: close stale LEASED rows whose dseq is no longer
+//      live for the canonical account.
 //
-// expires_at = (lease/deployment block-height converted via chain anchor) +
-// GROUP_LOCK_HOURS. Rows missing a parseable created_at are skipped with a
-// warning so we never inherit a wrong expiry.
+// Conservative DB guards:
+//   - Never downgrade PUT_OK / PUT_FAILED (daemon owns those).
+//   - Never delete / close rows with group_name set (daemon progressed past
+//     initial insert).
+//   - Never touch rows whose created_at >= scanStart (avoid racing the
+//     daemon's concurrent inserts).
 //
 // Usage:
 //   node scripts/ops/sync-live-deployments.js [--dry-run] [--account=NAME] [--limit=N]
@@ -25,7 +33,6 @@ import { loadAccountsFromDb } from "../../src/accounts-loader.js";
 import { request as akashRequest } from "../../src/akash.js";
 import { createPool, query, closePool } from "../../src/db/pool.js";
 
-const CONCURRENCY = 4;
 const LATEST_BLOCK_PATH = "/rest/cosmos/base/tendermint/v1beta1/blocks/latest";
 
 function parseArgs(argv) {
@@ -65,8 +72,6 @@ function extractProvider(d) {
   return null;
 }
 
-// console-api stores `created_at` as a block-height string. Prefer the first
-// lease's created_at (closer to "in use" start), else the deployment's.
 function extractLeasedHeight(d) {
   const leaseHeight = d?.leases?.[0]?.created_at;
   const depHeight = d?.deployment?.created_at;
@@ -119,11 +124,64 @@ async function listLive(ctx, pageSize) {
   return out;
 }
 
-// INSERT new row, or refresh metadata on the existing (account_id, dseq) row.
-// Never downgrade a healthier status — PUT_OK / PUT_FAILED stay (the daemon
-// or sweeper owns those state transitions). CLOSED/EXPIRED get promoted back
-// to LEASED if the deployment is alive again on Akash.
-async function upsert({ accountId, dseq, owner, provider, leasedAt, expiresAt }) {
+async function fetchAccount(account, config, limit) {
+  const ctx = { account, config, logger: { warn: () => {}, info: () => {} } };
+  try {
+    const raw = await listLive(ctx, limit);
+    return { account, raw, error: null };
+  } catch (err) {
+    return { account, raw: [], error: `${err.status ?? ""} ${err.message}`.trim() };
+  }
+}
+
+function normalize(d, anchor, lockHoursMs) {
+  if (!hasLease(d)) return { skip: "no_lease" };
+  const dseq = extractDseq(d);
+  if (!dseq) return { skip: "no_dseq" };
+  const owner = extractOwner(d);
+  if (!owner) return { skip: "no_owner", dseq };
+  const height = extractLeasedHeight(d);
+  if (height == null) return { skip: "no_created_at", dseq };
+  const leasedAt = heightToDate(height, anchor);
+  return {
+    dseq: String(dseq),
+    owner,
+    provider: extractProvider(d),
+    leasedAt,
+    expiresAt: new Date(leasedAt.getTime() + lockHoursMs),
+  };
+}
+
+// Bucket all per-account candidates by (owner, dseq). Lowest account.id wins
+// as canonical. We also track every account.id that saw the row so we can
+// clean up non-canonical duplicates in the DB.
+function dedupe(perAccount) {
+  const map = new Map();
+  for (const { account, candidates } of perAccount) {
+    for (const c of candidates) {
+      const key = `${c.owner}|${c.dseq}`;
+      const prev = map.get(key);
+      if (!prev) {
+        map.set(key, {
+          ...c,
+          canonicalAccountId: account.id,
+          canonicalAccountName: account.name,
+          seenByAccountIds: [account.id],
+        });
+      } else {
+        prev.seenByAccountIds.push(account.id);
+        if (account.id < prev.canonicalAccountId) {
+          prev.canonicalAccountId = account.id;
+          prev.canonicalAccountName = account.name;
+        }
+        prev.provider = prev.provider ?? c.provider ?? null;
+      }
+    }
+  }
+  return [...map.values()];
+}
+
+async function upsertCanonical(row) {
   const result = await query(
     `INSERT INTO deployments
        (dseq, account_id, owner, provider, status, leased_at, expires_at)
@@ -134,19 +192,31 @@ async function upsert({ accountId, dseq, owner, provider, leasedAt, expiresAt })
        provider   = COALESCE(provider, VALUES(provider)),
        leased_at  = COALESCE(leased_at, VALUES(leased_at)),
        expires_at = VALUES(expires_at)`,
-    [String(dseq), accountId, owner, provider, leasedAt, expiresAt],
+    [row.dseq, row.canonicalAccountId, row.owner, row.provider, row.leasedAt, row.expiresAt],
   );
   return result.affectedRows; // 1 = insert, 2 = update, 0 = no change
 }
 
-// Close LEASED rows for this account whose dseq disappeared from the live
-// API. Conservative guards:
-//   - status='LEASED' only — never touches PUT_OK / PUT_FAILED (daemon owns
-//     those once it has set group_name).
-//   - group_name IS NULL — skip rows the daemon has progressed past insert.
-//   - created_at < scanStart — never flip rows that the daemon may have just
-//     inserted *during* this script's run.
-async function reconcileClosed({ accountId, liveDseqs, scanStart, dryRun }) {
+// Delete duplicate rows for the same logical deployment that ended up under
+// a non-canonical account_id. Only touches rows still in the initial-import
+// state — never PUT_OK / PUT_FAILED / CLOSED / EXPIRED, never with a group.
+async function deleteNonCanonical({ dseq, owner, canonicalAccountId, scanStart }) {
+  const result = await query(
+    `DELETE FROM deployments
+     WHERE dseq = ?
+       AND account_id <> ?
+       AND status = 'LEASED'
+       AND group_name IS NULL
+       AND created_at < ?
+       AND (owner = ? OR owner IS NULL)`,
+    [dseq, canonicalAccountId, scanStart, owner],
+  );
+  return result.affectedRows;
+}
+
+// For the canonical account: flip LEASED rows whose dseq is not in the
+// live set to CLOSED. Same conservative guards as deleteNonCanonical.
+async function reconcileClosedForAccount({ accountId, liveDseqs, scanStart, dryRun }) {
   const notInLive = liveDseqs.length > 0
     ? `AND dseq NOT IN (${liveDseqs.map(() => "?").join(",")})`
     : "";
@@ -174,92 +244,6 @@ async function reconcileClosed({ accountId, liveDseqs, scanStart, dryRun }) {
     params,
   );
   return { affected: result.affectedRows, dseqs: [] };
-}
-
-async function syncAccount(account, config, anchor, scanStart, { dryRun, limit }) {
-  const ctx = { account, config, logger: { warn: () => {}, info: () => {} } };
-  const stats = {
-    account: account.name, fetched: 0, withLease: 0,
-    inserted: 0, updated: 0, closed: 0, skipped: 0, error: null,
-  };
-
-  let live;
-  try {
-    live = await listLive(ctx, limit);
-  } catch (err) {
-    stats.error = `${err.status ?? ""} ${err.message}`.trim();
-    return stats;
-  }
-  stats.fetched = live.length;
-
-  const lockHoursMs = config.GROUP_LOCK_HOURS * 3600 * 1000;
-  const liveDseqs = [];
-
-  for (const d of live) {
-    if (!hasLease(d)) continue;
-    stats.withLease++;
-
-    const dseq = extractDseq(d);
-    if (!dseq) {
-      stats.skipped++;
-      console.warn(`[sync-live] ${account.name}: row missing dseq — skipped`);
-      continue;
-    }
-    const height = extractLeasedHeight(d);
-    if (height == null) {
-      stats.skipped++;
-      console.warn(`[sync-live] ${account.name} dseq=${dseq}: no created_at block-height — skipped`);
-      continue;
-    }
-    liveDseqs.push(String(dseq));
-
-    const leasedAt = heightToDate(height, anchor);
-    const expiresAt = new Date(leasedAt.getTime() + lockHoursMs);
-    const owner = extractOwner(d);
-    const provider = extractProvider(d);
-
-    if (dryRun) {
-      console.log(
-        `[dry-run] ${account.name} dseq=${dseq} owner=${owner?.slice(0, 14) ?? "-"}… provider=${provider ?? "-"} expires=${expiresAt.toISOString()}`,
-      );
-      stats.inserted++;
-      continue;
-    }
-
-    const affected = await upsert({ accountId: account.id, dseq, owner, provider, leasedAt, expiresAt });
-    if (affected >= 2) stats.updated++;
-    else if (affected === 1) stats.inserted++;
-    // 0 = row identical to current — not counted
-  }
-
-  // Two-way reconcile: close stale LEASED rows for this account.
-  const closeRes = await reconcileClosed({
-    accountId: account.id,
-    liveDseqs,
-    scanStart,
-    dryRun,
-  });
-  stats.closed = closeRes.affected;
-  if (dryRun && closeRes.dseqs.length > 0) {
-    console.log(
-      `[dry-run] ${account.name} would CLOSE stale dseqs: ${closeRes.dseqs.join(", ")}`,
-    );
-  }
-
-  return stats;
-}
-
-async function runConcurrent(items, limit, worker) {
-  const results = new Array(items.length);
-  let next = 0;
-  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const i = next++;
-      results[i] = await worker(items[i]);
-    }
-  });
-  await Promise.all(runners);
-  return results;
 }
 
 function pad(s, n) { return String(s).padEnd(n); }
@@ -295,34 +279,149 @@ async function main() {
     process.exit(1);
   }
 
-  // Freeze the cutoff timestamp so reconcileClosed never touches rows the
-  // daemon may have inserted *after* this script started — those rows are
-  // by definition newer than our world-view snapshot.
   const scanStart = new Date();
 
   console.log(
-    `[sync-live] dry_run=${args.dryRun} accounts=${accounts.length} limit=${args.limit} concurrency=${CONCURRENCY} lock_hours=${config.GROUP_LOCK_HOURS} scan_start=${scanStart.toISOString()} chain_anchor=height=${anchor.height} time=${new Date(anchor.timeMs).toISOString()}`,
+    `[sync-live] dry_run=${args.dryRun} accounts=${accounts.length} limit=${args.limit} lock_hours=${config.GROUP_LOCK_HOURS} scan_start=${scanStart.toISOString()} chain_anchor=height=${anchor.height} time=${new Date(anchor.timeMs).toISOString()}`,
   );
 
-  const results = await runConcurrent(accounts, CONCURRENCY, (a) =>
-    syncAccount(a, config, anchor, scanStart, args),
-  );
+  // Phase 1 — fetch each account sequentially. Simple and avoids hammering
+  // console-api in parallel; the whole script finishes in a few seconds.
+  const fetched = [];
+  for (const a of accounts) {
+    fetched.push(await fetchAccount(a, config, args.limit));
+  }
 
-  console.log("\n[sync-live] per-account summary:");
-  let totIns = 0, totUpd = 0, totClosed = 0, totSkip = 0, totErr = 0;
-  for (const r of results) {
+  // Raw transparency: what each api-key actually returned, with the key
+  // prefix so the operator can sanity-check against curl manually.
+  console.log("\n[sync-live] raw fetch (api-key → dseqs):");
+  for (const r of fetched) {
+    const prefix = r.account.apiKey ? r.account.apiKey.slice(0, 24) + "…" : "?";
     if (r.error) {
-      console.log(`  ${pad(r.account, 24)} ERROR: ${r.error}`);
-      totErr++;
+      console.log(`  ${pad(r.account.name, 18)} key=${prefix} ERROR: ${r.error}`);
       continue;
     }
+    if (r.raw.length === 0) {
+      console.log(`  ${pad(r.account.name, 18)} key=${prefix} (0 deployments)`);
+      continue;
+    }
+    const summary = r.raw.map((d) => {
+      const dseq = extractDseq(d);
+      const owner = extractOwner(d);
+      const leases = (d?.leases ?? d?.deployment?.leases ?? []).length;
+      return `${dseq}/${owner?.slice(0, 14) ?? "?"}…(leases=${leases})`;
+    });
+    console.log(`  ${pad(r.account.name, 18)} key=${prefix} → ${summary.join(", ")}`);
+  }
+
+  // Phase 2 — normalize per account
+  const lockHoursMs = config.GROUP_LOCK_HOURS * 3600 * 1000;
+  const perAccount = [];
+  const stats = new Map();
+  for (const r of fetched) {
+    const s = { account: r.account.name, fetched: r.raw.length, with_lease: 0, skipped: 0, error: r.error };
+    stats.set(r.account.id, s);
+    if (r.error) { perAccount.push({ account: r.account, candidates: [] }); continue; }
+    const candidates = [];
+    for (const d of r.raw) {
+      const n = normalize(d, anchor, lockHoursMs);
+      if (n.skip === "no_lease") continue;
+      if (n.skip) {
+        s.skipped++;
+        console.warn(`[sync-live] ${r.account.name} ${n.skip}${n.dseq ? ` dseq=${n.dseq}` : ""} — skipped`);
+        continue;
+      }
+      s.with_lease++;
+      candidates.push(n);
+    }
+    perAccount.push({ account: r.account, candidates });
+  }
+
+  // Phase 3 — dedupe by (owner, dseq)
+  const canonical = dedupe(perAccount);
+  const shared = canonical.filter((r) => r.seenByAccountIds.length > 1);
+  console.log(
+    `\n[sync-live] dedupe: ${canonical.length} unique (owner,dseq) tuples; ${shared.length} shared across multiple accounts`,
+  );
+  for (const r of shared) {
+    const names = r.seenByAccountIds
+      .map((id) => accounts.find((a) => a.id === id)?.name ?? `id=${id}`);
     console.log(
-      `  ${pad(r.account, 24)} fetched=${r.fetched} with_lease=${r.withLease} inserted=${r.inserted} updated=${r.updated} closed=${r.closed} skipped=${r.skipped}`,
+      `  shared: dseq=${r.dseq} owner=${r.owner.slice(0, 14)}… seen_by=[${names.join(", ")}] canonical=${r.canonicalAccountName}`,
     );
-    totIns += r.inserted; totUpd += r.updated; totClosed += r.closed; totSkip += r.skipped;
+  }
+
+  // Phase 4 — write canonical rows + delete non-canonical duplicates.
+  // Track each account's "live LEASED set" for phase 5. An account's set
+  // includes ONLY dseqs where it is canonical. Non-canonical accounts'
+  // sets stay empty → phase 5 will close all their stale LEASED rows.
+  let inserted = 0, updated = 0, deleted = 0;
+  const liveByAccount = new Map(); // accountId → string[]
+  for (const r of fetched) {
+    if (!r.error) liveByAccount.set(r.account.id, []);
+  }
+  for (const row of canonical) {
+    const list = liveByAccount.get(row.canonicalAccountId) ?? [];
+    list.push(row.dseq);
+    liveByAccount.set(row.canonicalAccountId, list);
+
+    if (args.dryRun) {
+      console.log(
+        `[dry-run] upsert canonical: account=${row.canonicalAccountName} dseq=${row.dseq} owner=${row.owner.slice(0, 14)}… expires=${row.expiresAt.toISOString()}`,
+      );
+      continue;
+    }
+    const affected = await upsertCanonical(row);
+    if (affected >= 2) updated++;
+    else if (affected === 1) inserted++;
+
+    if (row.seenByAccountIds.length > 1) {
+      const removed = await deleteNonCanonical({
+        dseq: row.dseq,
+        owner: row.owner,
+        canonicalAccountId: row.canonicalAccountId,
+        scanStart,
+      });
+      if (removed > 0) {
+        deleted += removed;
+        console.log(
+          `[sync-live] deduped: dseq=${row.dseq} removed ${removed} non-canonical LEASED row(s); kept account=${row.canonicalAccountName}`,
+        );
+      }
+    }
+  }
+
+  // Phase 5 — close stale LEASED rows for every account that fetched
+  // successfully. For non-canonical accounts (shared wallet, lost to a
+  // lower-id account), their live set is empty → all their LEASED rows
+  // get closed. This is how legacy duplicates from the pre-dedup era get
+  // cleaned up. Errored accounts are skipped (can't tell "empty" from
+  // "fetch failed").
+  let totalClosed = 0;
+  for (const [accountId, liveDseqs] of liveByAccount) {
+    const acc = accounts.find((a) => a.id === accountId);
+    const res = await reconcileClosedForAccount({
+      accountId,
+      liveDseqs,
+      scanStart,
+      dryRun: args.dryRun,
+    });
+    totalClosed += res.affected;
+    if (args.dryRun && res.dseqs.length > 0) {
+      console.log(
+        `[dry-run] ${acc?.name ?? `id=${accountId}`} would CLOSE stale dseqs: ${res.dseqs.join(", ")}`,
+      );
+    }
+  }
+
+  console.log("\n[sync-live] per-account fetch summary:");
+  let totErr = 0;
+  for (const [, s] of stats) {
+    if (s.error) { console.log(`  ${pad(s.account, 24)} ERROR: ${s.error}`); totErr++; continue; }
+    console.log(`  ${pad(s.account, 24)} fetched=${s.fetched} with_lease=${s.with_lease} skipped=${s.skipped}`);
   }
   console.log(
-    `\n[sync-live] totals: inserted=${totIns} updated=${totUpd} closed=${totClosed} skipped=${totSkip} errors=${totErr} dry_run=${args.dryRun}`,
+    `\n[sync-live] write totals: inserted=${inserted} updated=${updated} closed=${totalClosed} deleted_non_canonical=${deleted} errors=${totErr} dry_run=${args.dryRun}`,
   );
 
   await closePool();

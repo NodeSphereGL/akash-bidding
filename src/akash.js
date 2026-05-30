@@ -83,11 +83,24 @@ async function transport(ctx, { url, headers, method, body }) {
   }
 }
 
+// Cloudflare caches GET responses from console-api with `Cache-Control:
+// private, max-age=30` and a cache key that does NOT include `x-api-key`.
+// Result: whoever warms the cache first, the next 30s of GETs from *any*
+// api-key get that first response — so different accounts see each other's
+// deployments. Confirmed by `cf-cache-status: HIT` in the response headers.
+// Curl avoided it by accident (different connection patterns). The fix is
+// a per-call cache-buster query param so every GET is unique → MISS.
+function bustCache(path) {
+  const sep = path.includes("?") ? "&" : "?";
+  return `${path}${sep}_t=${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 /** Console managed-wallet request. Adds x-api-key. Throws AkashApiError on non-2xx. */
 export async function request(ctx, method, path, body) {
   const { account, config } = ctx;
+  const finalPath = method === "GET" ? bustCache(path) : path;
   const res = await transport(ctx, {
-    url: `${config.AKASH_API_BASE}${path}`,
+    url: `${config.AKASH_API_BASE}${finalPath}`,
     headers: {
       "x-api-key": account.apiKey,
       "Content-Type": "application/json",
