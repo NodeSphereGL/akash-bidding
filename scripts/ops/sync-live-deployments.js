@@ -27,12 +27,13 @@ const LATEST_BLOCK_PATH = "/rest/cosmos/base/tendermint/v1beta1/blocks/latest";
 function parseArgs(argv) {
   // `limit` is the page size for /v1/deployments?skip=&limit= — the script
   // paginates until pagination.hasMore is false, so this is just a per-page
-  // tuning knob, not a hard cap on what we sync.
-  const out = { dryRun: false, account: null, limit: 1000 };
+  // tuning knob, not a hard cap on what we sync. Small page size keeps each
+  // request light; pagination handles accounts with many deployments.
+  const out = { dryRun: false, account: null, limit: 20 };
   for (const a of argv) {
     if (a === "--dry-run") out.dryRun = true;
     else if (a.startsWith("--account=")) out.account = a.slice("--account=".length);
-    else if (a.startsWith("--limit=")) out.limit = Number(a.slice("--limit=".length)) || 1000;
+    else if (a.startsWith("--limit=")) out.limit = Number(a.slice("--limit=".length)) || 20;
     else console.warn(`[sync-live] ignoring unknown arg: ${a}`);
   }
   return out;
@@ -117,7 +118,7 @@ async function fetchChainAnchor(config) {
 // rows when a wallet has more historical rows than `pageSize`. Loop until
 // pagination.hasMore === false (or a hard ceiling, as a safety stop).
 async function listLive(ctx, pageSize) {
-  const HARD_CEILING_PAGES = 20; // 20 * pageSize rows max — prevents infinite loop on broken API
+  const HARD_CEILING_PAGES = 50; // 50 * pageSize rows max — prevents infinite loop on broken API
   const out = [];
   let skip = 0;
   for (let page = 0; page < HARD_CEILING_PAGES; page++) {
