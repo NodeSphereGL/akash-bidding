@@ -1,18 +1,21 @@
 #!/usr/bin/env node
 // Reconcile live console-api deployment state into the local `deployments`
-// table. Additive only — inserts/upserts rows for active deployments per
-// account. Does NOT lock groups, does NOT flip missing rows to CLOSED.
+// table. Two-phase:
+//   1) Fetch active deployments per enabled account in parallel.
+//   2) Dedupe per (owner, dseq) — multiple api-keys can see the same wallet's
+//      deployments. Pick the lowest account.id as the canonical owner of the
+//      local row; upsert that; delete non-canonical (account_id, dseq) rows.
 //
-// Intended use: first-time prod reconciliation when DB is fresh but managed
-// wallets already hold live deployments (operator created them manually or
-// from an earlier daemon run).
+// Does NOT lock groups, does NOT flip missing rows to CLOSED — sweeper handles
+// expiry and group locks must be operator-controlled.
 //
 // Usage:
 //   node scripts/ops/sync-live-deployments.js [--dry-run] [--account=NAME] [--limit=N]
 //
-// expires_at is derived as (lease/created time from API) + GROUP_LOCK_HOURS.
-// Rows missing a parseable created time are skipped with a warning so the
-// operator can investigate manually instead of inheriting a wrong expiry.
+// expires_at = (lease/deployment block-height converted via chain anchor) +
+// GROUP_LOCK_HOURS. Rows missing a parseable created_at are skipped with a
+// warning so the operator can investigate manually instead of inheriting a
+// wrong expiry.
 
 import "dotenv/config";
 import { fetch } from "undici";
@@ -25,10 +28,6 @@ const CONCURRENCY = 4;
 const LATEST_BLOCK_PATH = "/rest/cosmos/base/tendermint/v1beta1/blocks/latest";
 
 function parseArgs(argv) {
-  // `limit` is the page size for /v1/deployments?skip=&limit= — the script
-  // paginates until pagination.hasMore is false, so this is just a per-page
-  // tuning knob, not a hard cap on what we sync. Small page size keeps each
-  // request light; pagination handles accounts with many deployments.
   const out = { dryRun: false, account: null, limit: 20 };
   for (const a of argv) {
     if (a === "--dry-run") out.dryRun = true;
@@ -64,6 +63,17 @@ function extractDseq(d) {
   );
 }
 
+function extractOwner(d) {
+  return (
+    d?.deployment?.deployment_id?.owner ??
+    d?.deployment?.id?.owner ??
+    d?.deployment_id?.owner ??
+    d?.id?.owner ??
+    d?.owner ??
+    null
+  );
+}
+
 function extractProvider(d) {
   const leases = d?.leases ?? d?.deployment?.leases ?? [];
   for (const l of leases) {
@@ -85,8 +95,8 @@ function extractLeasedHeight(d) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-// Linear height → wall-clock using a single chain anchor. Drift is bounded
-// by AVG_BLOCK_TIME_SECONDS variance — fine for 24h expiry math.
+// Linear height → wall-clock using a single chain anchor. Drift bounded by
+// AVG_BLOCK_TIME_SECONDS variance — fine for 24h expiry math.
 function heightToDate(height, anchor) {
   const ms = anchor.timeMs - (anchor.height - height) * AVG_BLOCK_TIME_SECONDS * 1000;
   return new Date(ms);
@@ -112,13 +122,8 @@ async function fetchChainAnchor(config) {
   }
 }
 
-// Paginate through ALL deployments using the documented skip+limit
-// parameters. Console-api returns a mix of active/closed in arbitrary order;
-// stopping at the first page (the previous behavior) silently drops active
-// rows when a wallet has more historical rows than `pageSize`. Loop until
-// pagination.hasMore === false (or a hard ceiling, as a safety stop).
 async function listLive(ctx, pageSize) {
-  const HARD_CEILING_PAGES = 50; // 50 * pageSize rows max — prevents infinite loop on broken API
+  const HARD_CEILING_PAGES = 50;
   const out = [];
   let skip = 0;
   for (let page = 0; page < HARD_CEILING_PAGES; page++) {
@@ -135,89 +140,99 @@ async function listLive(ctx, pageSize) {
   return out;
 }
 
-async function upsertDeployment({ accountId, dseq, provider, leasedAt, expiresAt }) {
-  // INSERT new row, or refresh an old terminal row back to LEASED if the
-  // remote deployment is still active. Never downgrade a healthier status
-  // (PUT_OK stays PUT_OK; PUT_FAILED stays PUT_FAILED so the nag continues).
+async function fetchAccount(account, config, limit) {
+  const ctx = { account, config, logger: { warn: () => {}, info: () => {} } };
+  const result = { account, raw: [], error: null };
+  try {
+    result.raw = await listLive(ctx, limit);
+  } catch (err) {
+    result.error = `${err.status ?? ""} ${err.message}`.trim();
+  }
+  return result;
+}
+
+// Normalize one API row to a candidate record. Returns null if the row is
+// closed / missing required fields — caller increments skip counters.
+function normalize(account, d, anchor, lockHoursMs) {
+  if (!isActive(d)) return { skip: "inactive" };
+  const dseq = extractDseq(d);
+  if (!dseq) return { skip: "no_dseq" };
+  const owner = extractOwner(d);
+  if (!owner) return { skip: "no_owner", dseq };
+  const height = extractLeasedHeight(d);
+  if (height == null) return { skip: "no_created_at", dseq };
+  const leasedAt = heightToDate(height, anchor);
+  const expiresAt = new Date(leasedAt.getTime() + lockHoursMs);
+  return {
+    dseq: String(dseq),
+    owner,
+    provider: extractProvider(d),
+    leasedAt,
+    expiresAt,
+    seenBy: account.id,
+  };
+}
+
+// Pick canonical account per (owner, dseq): lowest account.id among accounts
+// that observed the row. Deterministic + matches the existing daemon's
+// natural account ordering (lockNextAvailable uses ORDER BY name ASC, but
+// for sync-live we use id since it's stable across rename).
+function dedupe(perAccount) {
+  const map = new Map(); // key = owner + '|' + dseq
+  for (const { account, candidates } of perAccount) {
+    for (const c of candidates) {
+      const key = `${c.owner}|${c.dseq}`;
+      const prev = map.get(key);
+      if (!prev || account.id < prev.canonicalAccountId) {
+        map.set(key, {
+          owner: c.owner,
+          dseq: c.dseq,
+          provider: c.provider ?? prev?.provider ?? null,
+          leasedAt: c.leasedAt,
+          expiresAt: c.expiresAt,
+          canonicalAccountId: account.id,
+          canonicalAccountName: account.name,
+          seenByAccountIds: prev ? [...new Set([...prev.seenByAccountIds, account.id])] : [account.id],
+        });
+      } else {
+        prev.seenByAccountIds = [...new Set([...prev.seenByAccountIds, account.id])];
+        prev.provider = prev.provider ?? c.provider ?? null;
+      }
+    }
+  }
+  return [...map.values()];
+}
+
+async function upsertCanonical({ canonicalAccountId, owner, dseq, provider, leasedAt, expiresAt }) {
+  // INSERT new row, or refresh an old terminal row back to LEASED + record
+  // the wallet owner. Never downgrade a healthier status (PUT_OK stays
+  // PUT_OK; PUT_FAILED stays PUT_FAILED so the nag continues).
   const result = await query(
     `INSERT INTO deployments
-       (dseq, account_id, provider, status, leased_at, expires_at)
-     VALUES (?, ?, ?, 'LEASED', ?, ?)
+       (dseq, account_id, owner, provider, status, leased_at, expires_at)
+     VALUES (?, ?, ?, ?, 'LEASED', ?, ?)
      ON DUPLICATE KEY UPDATE
        status     = IF(status IN ('CLOSED','EXPIRED'), 'LEASED', status),
+       owner      = COALESCE(owner, VALUES(owner)),
        provider   = COALESCE(provider, VALUES(provider)),
        leased_at  = COALESCE(leased_at, VALUES(leased_at)),
        expires_at = VALUES(expires_at)`,
-    [String(dseq), accountId, provider, leasedAt, expiresAt],
+    [dseq, canonicalAccountId, owner, provider, leasedAt, expiresAt],
   );
-  // mysql2 affectedRows convention: 1 = insert, 2 = update, 0 = no change.
   return result.affectedRows;
 }
 
-async function syncAccount(account, config, anchor, { dryRun, limit }) {
-  const ctx = { account, config, logger: { warn: () => {}, info: () => {} } };
-  const stats = {
-    account: account.name,
-    fetched: 0,
-    active: 0,
-    inserted: 0,
-    updated: 0,
-    skippedNoCreatedAt: 0,
-    skippedNoDseq: 0,
-    error: null,
-  };
-
-  let live;
-  try {
-    live = await listLive(ctx, limit);
-  } catch (err) {
-    stats.error = `${err.status ?? ""} ${err.message}`.trim();
-    return stats;
-  }
-  stats.fetched = live.length;
-
-  const lockHoursMs = config.GROUP_LOCK_HOURS * 3600 * 1000;
-
-  for (const d of live) {
-    if (!isActive(d)) continue;
-    stats.active++;
-    const dseq = extractDseq(d);
-    if (!dseq) {
-      stats.skippedNoDseq++;
-      console.warn(`[sync-live] ${account.name}: row missing dseq, skipped`);
-      continue;
-    }
-    const height = extractLeasedHeight(d);
-    if (height == null) {
-      stats.skippedNoCreatedAt++;
-      console.warn(`[sync-live] ${account.name} dseq=${dseq}: no created_at block-height on API row — skipped`);
-      continue;
-    }
-    const leasedAt = heightToDate(height, anchor);
-    const expiresAt = new Date(leasedAt.getTime() + lockHoursMs);
-    const provider = extractProvider(d);
-
-    if (dryRun) {
-      console.log(
-        `[dry-run] ${account.name} dseq=${dseq} leased_at=${leasedAt.toISOString()} expires_at=${expiresAt.toISOString()} provider=${provider ?? "-"}`,
-      );
-      stats.inserted++;
-      continue;
-    }
-
-    const affected = await upsertDeployment({
-      accountId: account.id,
-      dseq,
-      provider,
-      leasedAt,
-      expiresAt,
-    });
-    if (affected >= 2) stats.updated++;
-    else if (affected === 1) stats.inserted++;
-    // 0 = row existed but no field actually changed; not counted.
-  }
-
-  return stats;
+// Remove non-canonical shared-wallet rows. Constrained to LEASED status so
+// we never delete a row that a daemon loop has progressed past initial
+// import (PUT_OK / PUT_FAILED / CLOSED / EXPIRED are preserved).
+async function deleteNonCanonical({ owner, dseq, canonicalAccountId }) {
+  const result = await query(
+    `DELETE FROM deployments
+     WHERE dseq = ? AND account_id <> ? AND status = 'LEASED'
+       AND (owner = ? OR owner IS NULL)`,
+    [dseq, canonicalAccountId, owner],
+  );
+  return result.affectedRows;
 }
 
 async function runConcurrent(items, limit, worker) {
@@ -233,9 +248,7 @@ async function runConcurrent(items, limit, worker) {
   return results;
 }
 
-function pad(s, n) {
-  return String(s).padEnd(n);
-}
+function pad(s, n) { return String(s).padEnd(n); }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -271,28 +284,81 @@ async function main() {
     `[sync-live] dry_run=${args.dryRun} accounts=${accounts.length} limit=${args.limit} concurrency=${CONCURRENCY} lock_hours=${config.GROUP_LOCK_HOURS} chain_anchor=height=${anchor.height} time=${new Date(anchor.timeMs).toISOString()}`,
   );
 
-  const results = await runConcurrent(accounts, CONCURRENCY, (a) =>
-    syncAccount(a, config, anchor, args),
+  // --- phase 1: fetch live state per account ---
+  const fetchResults = await runConcurrent(accounts, CONCURRENCY, (a) =>
+    fetchAccount(a, config, args.limit),
   );
 
-  console.log("\n[sync-live] per-account summary:");
-  let totIns = 0, totUpd = 0, totSkip = 0, totErr = 0;
-  for (const r of results) {
-    if (r.error) {
-      console.log(`  ${pad(r.account, 24)} ERROR: ${r.error}`);
-      totErr++;
+  // --- phase 2: normalize + bucket by account ---
+  const lockHoursMs = config.GROUP_LOCK_HOURS * 3600 * 1000;
+  const perAccount = [];
+  const accountStats = new Map();
+  for (const r of fetchResults) {
+    const stat = { account: r.account.name, fetched: r.raw.length, active: 0, skipped: 0, error: r.error };
+    accountStats.set(r.account.id, stat);
+    if (r.error) { perAccount.push({ account: r.account, candidates: [] }); continue; }
+    const candidates = [];
+    for (const d of r.raw) {
+      const n = normalize(r.account, d, anchor, lockHoursMs);
+      if (n.skip === "inactive") continue;
+      if (n.skip) {
+        stat.skipped++;
+        console.warn(`[sync-live] ${r.account.name} ${n.skip}${n.dseq ? ` dseq=${n.dseq}` : ""} — skipped`);
+        continue;
+      }
+      stat.active++;
+      candidates.push(n);
+    }
+    perAccount.push({ account: r.account, candidates });
+  }
+
+  // --- phase 3: dedupe by (owner, dseq) ---
+  const canonicalRows = dedupe(perAccount);
+  const sharedRows = canonicalRows.filter((r) => r.seenByAccountIds.length > 1);
+  console.log(
+    `\n[sync-live] dedupe: ${canonicalRows.length} unique (owner,dseq) tuples; ${sharedRows.length} shared across multiple accounts`,
+  );
+  for (const r of sharedRows) {
+    const names = r.seenByAccountIds.map((id) => {
+      const acc = accounts.find((a) => a.id === id);
+      return acc?.name ?? `id=${id}`;
+    });
+    console.log(
+      `  shared: dseq=${r.dseq} owner=${r.owner.slice(0, 14)}… seen_by=[${names.join(", ")}] canonical=${r.canonicalAccountName}`,
+    );
+  }
+
+  // --- phase 4: write canonical rows + remove non-canonical duplicates ---
+  let inserted = 0, updated = 0, deleted = 0;
+  for (const row of canonicalRows) {
+    if (args.dryRun) {
+      console.log(
+        `[dry-run] upsert canonical: account=${row.canonicalAccountName} dseq=${row.dseq} owner=${row.owner.slice(0, 14)}… expires=${row.expiresAt.toISOString()}`,
+      );
       continue;
     }
-    const skipped = r.skippedNoCreatedAt + r.skippedNoDseq;
-    console.log(
-      `  ${pad(r.account, 24)} fetched=${r.fetched} active=${r.active} inserted=${r.inserted} updated=${r.updated} skipped=${skipped}`,
-    );
-    totIns += r.inserted;
-    totUpd += r.updated;
-    totSkip += skipped;
+    const affected = await upsertCanonical(row);
+    if (affected >= 2) updated++;
+    else if (affected === 1) inserted++;
+
+    if (row.seenByAccountIds.length > 1) {
+      const removed = await deleteNonCanonical(row);
+      if (removed > 0) {
+        deleted += removed;
+        console.log(
+          `[sync-live] deduped: dseq=${row.dseq} removed ${removed} non-canonical LEASED row(s); kept account=${row.canonicalAccountName}`,
+        );
+      }
+    }
+  }
+
+  console.log("\n[sync-live] per-account fetch summary:");
+  for (const [, s] of accountStats) {
+    if (s.error) console.log(`  ${pad(s.account, 24)} ERROR: ${s.error}`);
+    else console.log(`  ${pad(s.account, 24)} fetched=${s.fetched} active=${s.active} skipped=${s.skipped}`);
   }
   console.log(
-    `\n[sync-live] totals inserted=${totIns} updated=${totUpd} skipped=${totSkip} errors=${totErr} dry_run=${args.dryRun}`,
+    `\n[sync-live] write totals: inserted=${inserted} updated=${updated} deleted_non_canonical=${deleted} dry_run=${args.dryRun}`,
   );
 
   await closePool();

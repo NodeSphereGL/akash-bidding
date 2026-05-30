@@ -9,7 +9,7 @@
 import { query } from "../pool.js";
 import { DbError } from "../../errors.js";
 
-const COLS = "id, dseq, account_id, group_name, provider, uact_per_block, status, leased_at, expires_at, put_attempts, auto_topup_disabled, last_error, created_at, updated_at";
+const COLS = "id, dseq, account_id, owner, group_name, provider, uact_per_block, status, leased_at, expires_at, put_attempts, auto_topup_disabled, last_error, created_at, updated_at";
 
 function exec(conn, sql, params) {
   if (conn) return conn.query(sql, params).then(([rows]) => rows);
