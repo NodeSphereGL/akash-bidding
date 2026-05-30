@@ -3,14 +3,27 @@
 State machine for a group row:
 
 ```
-AVAILABLE ──lockNextAvailable──► LOCKED ──sweeper(expires_at<NOW)──► AVAILABLE
-                                   │
-                                   └──PUT failure──► PUT_FAILED ──manual release──► AVAILABLE
+AVAILABLE ──lockNextAvailablePending──► LOCKED(pending, dseq=NULL, TTL≈10min)
+                                              │
+                                              ├── POST succeeds + bindLockToDseq ──► LOCKED(full, dseq=X, TTL=24h)
+                                              │                                          │
+                                              │                                          └── lease + insert ──► (group stays LOCKED until expiry)
+                                              │
+                                              ├── POST fails / no bid ──► group released ──► AVAILABLE
+                                              │
+                                              └── daemon crash / sweeper(expires_at<NOW) ──► AVAILABLE
 
-PUT_FAILED: locked metadata preserved (locked_dseq, locked_at, expires_at),
-            last_nag_at advances every 30 min (Telegram).
-DISABLED:   manual — sweeper and lockNextAvailable both skip these.
+PUT_FAILED: legacy state for historical rows from the old POST→PUT flow.
+            New cycles never produce this. Sweeper continues to nag any
+            remaining rows every 30 min until released manually.
+DISABLED:   manual — sweeper and lockNextAvailable* both skip these.
 ```
+
+Two-stage lock rationale: the pending lock has a short TTL
+(`GROUP_LOCK_PENDING_MINUTES`, default 10) so a crash between lock and lease
+auto-recovers quickly. On lease success, `bindLockToDseq` promotes the row
+to the full `GROUP_LOCK_HOURS` TTL with `locked_dseq` bound to the actual
+deployment dseq.
 
 ## Daily ops
 
@@ -25,7 +38,13 @@ curl -s 'http://127.0.0.1:8088/v1/groups?status=PUT_FAILED' | jq
 curl -s 'http://127.0.0.1:8088/v1/deployments?status=PUT_FAILED' | jq
 ```
 
-## PUT_FAILED runbook
+## PUT_FAILED runbook (legacy historical rows only)
+
+New cycles do not produce `PUT_FAILED` — SDL is POSTed once with the real
+`GROUP_NAME` baked in, so there is no PUT step to fail. The state and runbook
+below apply only to historical rows produced before the lock-before-POST
+refactor. If you see fresh `PUT_FAILED` rows after the refactor shipped,
+something is wrong — file a bug.
 
 Telegram message format (every 30 min until status changes):
 
@@ -68,7 +87,7 @@ curl -s -X PUT http://127.0.0.1:8088/v1/groups/v247_group_05 \
   -d '{"status":"DISABLED","notes":"folder lacks XYZ"}'
 ```
 
-Sweeper + `lockNextAvailable` skip DISABLED rows; safe to leave indefinitely.
+Sweeper + `lockNextAvailable*` skip DISABLED rows; safe to leave indefinitely.
 
 ## Adding a new group
 
@@ -101,10 +120,10 @@ curl -s -X POST http://127.0.0.1:8088/v1/groups \
 ## Lease orphan
 
 A `lease.orphan` event fires when the on-chain lease succeeds but the local
-post-lease transaction (insert deployment row + lock next group) rolls back —
-e.g. DB outage mid-cycle. The lease keeps accruing cost on Akash with no local
-audit row. Sweeper does **not** auto-close it; the operator must close it
-manually so the root cause stays visible.
+`deployments` insert fails (e.g. DB outage mid-cycle). The lease keeps
+accruing cost on Akash with no local audit row. The orchestrator attempts
+containment automatically (close + auto-topup disable) but cannot guarantee
+success on every failure mode. Operator triages from there.
 
 Triage:
 
@@ -122,7 +141,7 @@ Triage:
 ## Workspace scoping
 
 Each account and each group has a `workspace` column (`VARCHAR(64)`, default
-`'DEFAULT'`). At lock-time `lockNextAvailable` requires strict equality:
+`'DEFAULT'`). At lock-time `lockNextAvailablePending` requires strict equality:
 `account.workspace = group.workspace`. A `DEFAULT` account will never pick up
 a `validator247` group and vice versa.
 
@@ -150,8 +169,8 @@ Notes:
 - Workspace values: 1-64 chars, regex `/^[a-z0-9_-]+$/i`. Empty or invalid → 400.
 - Re-tagging a `LOCKED` group is allowed; it takes effect on the next lock cycle.
 - **Footgun**: if you re-tag the account but forget the matching groups (or vice
-  versa), the loop hits `group.none-available` and Telegram nags. Always re-tag
-  both sides in the same change window.
+  versa), the loop logs `no_group.skip_cycle` and idles. Always re-tag both
+  sides in the same change window.
 
 ## Backups
 

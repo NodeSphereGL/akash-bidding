@@ -12,7 +12,7 @@ const TEMPLATE = resolve(__dirname, "../akash-deploy.yaml");
 
 test("sdl: loadTemplate parses and exposes the rpow service", async () => {
   const t = await sdl.loadTemplate(TEMPLATE);
-  assert.ok(t.raw.includes("toanbk/rpow2:v1"), "raw must include image");
+  assert.ok(t.raw.includes("toanbk/rpow2:v3"), "raw must include image");
   assert.ok(t.parsed.services["service-rpow"], "parsed must expose service-rpow");
 });
 
@@ -20,7 +20,7 @@ test("sdl: injectGroupName produces YAML containing exact GROUP_NAME=<name> and 
   const t = await sdl.loadTemplate(TEMPLATE);
   const out = sdl.injectGroupName(t, "group_01_vast_ai");
   assert.match(out, /GROUP_NAME=group_01_vast_ai/);
-  assert.match(out, /toanbk\/rpow2:v1/);
+  assert.match(out, /toanbk\/rpow2:v3/);
 });
 
 test("sdl: injectGroupName is pure — template not mutated across multiple calls", async () => {

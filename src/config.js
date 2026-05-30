@@ -70,11 +70,14 @@ export function loadConfig() {
     MAX_UACT_PER_BLOCK: int("MAX_UACT_PER_BLOCK", 0),
     GPU_BLACKLIST: csvLower("GPU_BLACKLIST"),
 
-    BID_WAIT_MS: int("BID_WAIT_MS", 120000),
-    BID_POLL_INTERVAL_MS: int("BID_POLL_INTERVAL_MS", 10000),
+    // Defaults tuned for GPU-scarce environments: fast no-bid cycles so we
+    // bid more often. See `.env.example` for the cycle-time math. Override
+    // any of these via env if your environment needs different pacing.
+    BID_WAIT_MS: int("BID_WAIT_MS", 45000),
+    BID_POLL_INTERVAL_MS: int("BID_POLL_INTERVAL_MS", 5000),
     LEASE_HOLD_MS: int("LEASE_HOLD_MS", 3600000),
-    RETRY_MIN_MS: int("RETRY_MIN_MS", 60000),
-    RETRY_MAX_MS: int("RETRY_MAX_MS", 180000),
+    RETRY_MIN_MS: int("RETRY_MIN_MS", 15000),
+    RETRY_MAX_MS: int("RETRY_MAX_MS", 30000),
     REQUEST_TIMEOUT_MS: int("REQUEST_TIMEOUT_MS", 30000),
     NO_MATCH_EXHAUST_THRESHOLD: int("NO_MATCH_EXHAUST_THRESHOLD", 10),
     STARTUP_JITTER_MS: int("STARTUP_JITTER_MS", 30000),
@@ -89,6 +92,11 @@ export function loadConfig() {
     MYSQL_DATABASE: str("MYSQL_DATABASE", ""),
 
     GROUP_LOCK_HOURS: int("GROUP_LOCK_HOURS", 24),
+    // Short TTL on the pre-POST pending lock. Covers BID_WAIT_MS (default
+    // 120s) + lease attempts + margin. If the daemon crashes after locking
+    // a group but before lease success, the sweeper auto-releases at this
+    // TTL — far shorter than the 24h GROUP_LOCK_HOURS window.
+    GROUP_LOCK_PENDING_MINUTES: int("GROUP_LOCK_PENDING_MINUTES", 10),
     SWEEP_INTERVAL_MS: int("SWEEP_INTERVAL_MS", 300_000),
     PUT_NAG_INTERVAL_MS: int("PUT_NAG_INTERVAL_MS", 1_800_000),
 
@@ -118,6 +126,9 @@ export function loadConfig() {
   }
   if (!(config.GROUP_LOCK_HOURS > 0)) {
     throw new Error("config: GROUP_LOCK_HOURS must be > 0");
+  }
+  if (!(config.GROUP_LOCK_PENDING_MINUTES >= 2 && config.GROUP_LOCK_PENDING_MINUTES <= 60)) {
+    throw new Error("config: GROUP_LOCK_PENDING_MINUTES must be between 2 and 60");
   }
   return config;
 }

@@ -48,35 +48,54 @@ npm run db:seed-groups -- --dir=/path/to/rpow2/data # scans dir → groups table
 npm run db:import-accounts                          # accounts.json → accounts table (one-shot, idempotent)
 ```
 
-Place your SDL at `./akash-deploy.yaml` (a working example with `GROUP_NAME=__PLACEHOLDER__` is included; the daemon overwrites the placeholder per-lease via PUT).
+Place your SDL at `./akash-deploy.yaml` (a working example with `GROUP_NAME=__PLACEHOLDER__` is included; the daemon overwrites the placeholder at POST time per-cycle — no post-lease PUT, single ReplicaSet on the provider).
 
-## Post-lease automation
+## Per-cycle automation
 
-After lease success, each loop now:
+Each cycle, per account:
 
-1. **Atomic** (single mysql tx): inserts audit row in `deployments`
-   (`status=LEASED`, `expires_at=NOW+24h`) AND locks the next AVAILABLE group
-   via `SELECT ... FOR UPDATE`. Either both succeed or both roll back — no
-   orphan locked groups when the DB hiccups.
-2. `PUT /v1/deployments/{dseq}` with the SDL template + the picked group's
-   name injected into `GROUP_NAME=`.
-3. `PATCH /v2/deployment-settings/{dseq}` with `data.autoTopUpEnabled=false`
+1. **Pre-flight gate** — atomically lock the next AVAILABLE group in this
+   account's workspace via `SELECT ... FOR UPDATE`. The lock starts with
+   `locked_dseq=NULL` and a short TTL (`GROUP_LOCK_PENDING_MINUTES`, default
+   10). If no group is AVAILABLE, the cycle is skipped — no POST, no escrow
+   risk. Add capacity via `npm run db:seed-groups` or the admin API.
+2. `POST /v1/deployments` with the SDL template + the locked group's name
+   injected into `GROUP_NAME=` BEFORE POST. The provider sees a single
+   `spec.template`; one ReplicaSet, one rollout.
+3. Promote the pending lock to full state: bind the returned `dseq` and
+   extend `expires_at` to `GROUP_LOCK_HOURS` (default 24h).
+4. Poll bids, filter, lease the top candidate.
+5. On lease success: insert audit row in `deployments` with
+   `status=PUT_OK, group_name, leased_at, expires_at`. Then
+   `PATCH /v2/deployment-settings/{dseq}` with `data.autoTopUpEnabled=false`
    so console managed-wallet doesn't auto-refill escrow → deployment cleanly
    evicts when deposit drains.
-4. Flips deployment row → `PUT_OK` (or `PUT_FAILED` + Telegram alert + 30-min
-   nag from sweeper). Sets `auto_topup_disabled=true` on success.
-5. Background sweeper (every `SWEEP_INTERVAL_MS`, default 5 min):
-   - releases locks whose `expires_at < NOW()`
+6. On no-bid / all-leases-failed: close the deployment (refunds escrow) and
+   release the group lock so another account can take it.
+7. Background sweeper (every `SWEEP_INTERVAL_MS`, default 5 min):
+   - releases locks whose `expires_at < NOW()` — picks up pending-lock
+     orphans within `GROUP_LOCK_PENDING_MINUTES` if the daemon crashes
+     between lock and lease
    - retries any PATCH that failed mid-cycle (escrow refill guard)
    - fires `lease.orphan` Telegram alert if any active row stays
      `auto_topup_disabled=false` for more than 1h
+   - nags historical `PUT_FAILED` group rows (legacy state — no new ones
+     are produced under the lock-before-POST flow)
 
-If the on-chain lease succeeds but the post-lease tx fails (DB outage etc.),
+If the on-chain lease succeeds but the DB insert fails (DB outage etc.),
 a `lease.orphan` Telegram alert fires with `account + dseq + error`. The
 daemon does **not** auto-close — operator triages via
 `scripts/ops/close-test-leases.js` and the console UI.
 
 Zero SSH, zero `git checkout`, zero tmux required post-lease.
+
+### Group supply sizing
+
+The pre-flight gate locks one group per concurrent in-flight cycle. As a
+rule of thumb, keep `N_groups ≥ N_accounts × 2` so accounts don't briefly
+contend during the bid-wait window (`BID_WAIT_MS`, default 120s) or while
+holding a successful lease (`LEASE_HOLD_MS`, default 1h). If `no_group.skip_cycle`
+appears regularly in the logs, add more rows to the `groups` table.
 
 ### Note on dseq uniqueness
 
@@ -192,7 +211,8 @@ tail -f logs/akash-bidding.log | jq 'select(.event=="lease.success")'
 - Admin API is loopback + no auth — SSH-tunnel for remote admin.
 - Substring blacklist can over-match (e.g. `a10` matches `a100`); pick blacklist entries carefully.
 - No Telegram rate-limit throttling; acceptable at current N but revisit if N > 20 accounts.
-- A PUT failure burns 24h of trial credit silently aside from the 30-min Telegram nag. Operator must release the group manually via the admin API.
+- Bad-provider scheduling failures (provider's K8s cluster maxed on pods) burn the 24h lease hold silently — daemon does not health-probe the workload. Operator detects via absent activity and closes manually.
+- Pre-flight gate skips the cycle when no group is AVAILABLE — daemon idles cheaply until a group expires or an operator seeds more.
 
 ## Layout
 
@@ -205,10 +225,9 @@ src/
   notify.js              Telegram bot client + typed notifiers (incl. notifyLeaseOrphan)
   logger.js              JSONL file + stdout
   index.js               runAccountLoop + supervisor (Promise.allSettled)
-  post-lease.js          atomic insert + group-lock tx (rolls back together)
-  sdl.js                 SDL template loader + GROUP_NAME injector
+  sdl.js                 SDL template loader + GROUP_NAME injector (per-POST)
   sweeper.js             background expiry + PUT_FAILED nag + auto-topup retry
-  errors.js              AkashApiError, DbError, NoGroupAvailableError
+  errors.js              AkashApiError, DbError
   db/
     pool.js              mysql2 pool + query + withTx helpers
     migrations/{001..004}_*.sql
@@ -237,7 +256,6 @@ tests/
   sweeper-auto-topup-retry.test.js
   notify-put-failed.test.js
   api-validation.test.js
-  post-lease-atomic.test.js
   akash-disable-autotopup.test.js
   groups-repo-race.int.test.js   (gated by MYSQL_TEST_*)
   fixtures/bids-sample.json

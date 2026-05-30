@@ -9,6 +9,11 @@ services:
         to:
           - global: true
     env:
+      # GROUP_NAME is injected by the daemon at POST time (per-cycle) once a
+      # group has been pre-locked from the local DB. The literal below is a
+      # placeholder kept for SDL-validity when this file is rendered manually;
+      # the daemon overwrites the entire env array via src/sdl.js#injectGroupName
+      # before sending POST /v1/deployments. There is NO post-lease PUT.
       - GROUP_NAME=__PLACEHOLDER__
 profiles:
   compute:

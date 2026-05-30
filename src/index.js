@@ -33,8 +33,6 @@ import * as groupsRepo from "./db/repo/groups.js";
 import * as deploymentsRepo from "./db/repo/deployments.js";
 import * as accountsRepo from "./db/repo/accounts.js";
 import { createPool, closePool, ping as dbPing } from "./db/pool.js";
-import { postLeaseAtomic } from "./post-lease.js";
-import { NoGroupAvailableError } from "./errors.js";
 import { startSweeper } from "./sweeper.js";
 import { startApiServer } from "./api/server.js";
 
@@ -190,6 +188,21 @@ export async function runAccountLoop(account, deps) {
   let noMatchStreak = 0;
   let exitReason = "aborted";
 
+  const dbWired = !!(deploymentsRepoDep && groupsRepoDep);
+
+  // Best-effort group release. Swallows DB errors — caller path is already
+  // unwinding for some other reason, and the sweeper will pick up any leak
+  // at the GROUP_LOCK_PENDING_MINUTES TTL anyway.
+  const releaseGroupSafe = async (cycleLog, name) => {
+    if (!dbWired || !name) return;
+    try {
+      await groupsRepoDep.release(name);
+      cycleLog.info("group.released", { group: name });
+    } catch (e) {
+      cycleLog.warn("group.release.failed", { group: name, error: e.message });
+    }
+  };
+
   while (!abortSignal?.aborted) {
     const cycleLog = logger.child({ account: account.name });
     const ctx = { account, config, logger: cycleLog };
@@ -210,28 +223,94 @@ export async function runAccountLoop(account, deps) {
         cycleLog.warn("health.check.error", { error: err.message });
       }
 
+      // ── Pre-flight: lock a group BEFORE POST so the SDL ships with the real
+      // GROUP_NAME baked in (single ReplicaSet on the provider, no PUT).
+      // If no AVAILABLE group, skip the cycle entirely — no POST, no escrow
+      // at risk. Operator adds capacity via `npm run db:seed-groups`.
+      let group = null;
+      if (dbWired) {
+        try {
+          group = await groupsRepoDep.lockNextAvailablePending(
+            account.id,
+            account.workspace,
+            config.GROUP_LOCK_PENDING_MINUTES,
+          );
+        } catch (err) {
+          cycleLog.error("group.lock.pending.failed", { error: err.message });
+          await sleep(randomBetween(config.RETRY_MIN_MS, config.RETRY_MAX_MS), abortSignal);
+          continue;
+        }
+        if (!group) {
+          cycleLog.warn("no_group.skip_cycle", { workspace: account.workspace });
+          await sleep(randomBetween(config.RETRY_MIN_MS, config.RETRY_MAX_MS), abortSignal);
+          continue;
+        }
+        cycleLog.info("group.locked.pending", {
+          group: group.name,
+          ttl_min: config.GROUP_LOCK_PENDING_MINUTES,
+        });
+      }
+
+      // Bake real GROUP_NAME into SDL (per-cycle). Test path with no
+      // sdlTemplate/sdlMod falls back to raw `sdl` for compatibility.
+      let cycleSdl = sdl;
+      if (group && sdlTemplate && sdlInjector) {
+        try {
+          cycleSdl = sdlInjector.injectGroupName(sdlTemplate, group.name);
+        } catch (err) {
+          cycleLog.error("sdl.inject.failed", { group: group.name, error: err.message });
+          await releaseGroupSafe(cycleLog, group.name);
+          await sleep(randomBetween(config.RETRY_MIN_MS, config.RETRY_MAX_MS), abortSignal);
+          continue;
+        }
+      }
+
       let dseq;
       let manifest;
       try {
-        const created = await akash.createDeployment(ctx, sdl, config.DEPOSIT_USD);
+        const created = await akash.createDeployment(ctx, cycleSdl, config.DEPOSIT_USD);
         dseq = created.dseq;
         manifest = created.manifest;
-        cycleLog.info("deployment.created", { dseq, txHash: created.txHash });
+        cycleLog.info("deployment.created", {
+          dseq,
+          txHash: created.txHash,
+          group: group?.name ?? null,
+        });
       } catch (err) {
         if (!(err instanceof AkashApiError)) throw err;
         if (err.status === 401) {
           cycleLog.warn("auth.fail", { status: 401 });
           await notify.notifyAuthFail(account, tgCfg(config, cycleLog));
+          await releaseGroupSafe(cycleLog, group?.name);
           exitReason = "401";
           break;
         }
         if (/insufficient|credit|balance/i.test(JSON.stringify(err.body || ""))) {
+          await releaseGroupSafe(cycleLog, group?.name);
           exitReason = `insufficient credit on create: ${err.status}`;
           break;
         }
         cycleLog.warn("deployment.create.failed", { status: err.status, error: err.message });
+        await releaseGroupSafe(cycleLog, group?.name);
         await sleep(randomBetween(config.RETRY_MIN_MS, config.RETRY_MAX_MS), abortSignal);
         continue;
+      }
+
+      // Promote the pending lock to full TTL with the dseq bound. Crash window
+      // shrinks to ~30s (between POST success and this bind) instead of ~120s
+      // bid wait — and any orphan still gets swept at PENDING_MINUTES TTL.
+      if (group) {
+        try {
+          await groupsRepoDep.bindLockToDseq(group.name, dseq, config.GROUP_LOCK_HOURS);
+        } catch (err) {
+          // Programming error or DB outage. Close on-chain to stop escrow drain,
+          // release the group, sleep + retry.
+          cycleLog.error("group.bind.failed", { group: group.name, dseq, error: err.message });
+          await akash.closeDeployment(ctx, dseq).catch(() => {});
+          await releaseGroupSafe(cycleLog, group.name);
+          await sleep(randomBetween(config.RETRY_MIN_MS, config.RETRY_MAX_MS), abortSignal);
+          continue;
+        }
       }
 
       let owner;
@@ -242,6 +321,7 @@ export async function runAccountLoop(account, deps) {
         if (!(err instanceof AkashApiError)) throw err;
         cycleLog.warn("owner.resolve.failed", { error: err.message });
         await akash.closeDeployment(ctx, dseq).catch(() => {});
+        await releaseGroupSafe(cycleLog, group?.name);
         await sleep(randomBetween(config.RETRY_MIN_MS, config.RETRY_MAX_MS), abortSignal);
         continue;
       }
@@ -256,90 +336,58 @@ export async function runAccountLoop(account, deps) {
         const now = new Date();
         const expiresAt = addHours(now, config.GROUP_LOCK_HOURS);
 
-        // 1+2. Atomic: insert deployments row AND lock next group, or neither.
-        let group = null;
+        // SDL was POSTed with the real GROUP_NAME already baked in — no PUT
+        // needed, no second ReplicaSet on the provider. Status is PUT_OK
+        // directly on insert.
         let putStatus = null;
-        const dbWired = !!(deploymentsRepoDep && groupsRepoDep);
         if (dbWired) {
           try {
-            const r = await postLeaseAtomic({
-              db: { deploymentsRepo: deploymentsRepoDep, groupsRepo: groupsRepoDep },
+            await deploymentsRepoDep.insert({
               dseq,
-              account,
-              leaseResult: result,
-              hours: config.GROUP_LOCK_HOURS,
-              now,
+              accountId: account.id,
+              groupName: group.name,
+              provider: result.bid?.provider ?? null,
+              uactPerBlock: result.bid?.uactPerBlock ?? null,
+              status: "PUT_OK",
+              leasedAt: now,
               expiresAt,
             });
-            group = r.group;
-          } catch (err) {
-            // Either branch: lease succeeded on-chain but we cannot run a
-            // workload. Stop the bleed immediately — close on-chain (terminates
-            // lease, returns escrow) and as backstop disable auto-topup so
-            // managed wallet can't refill drained escrow if close fails.
-            const containment = await containLeasedDeployment({
-              ctx, dseq, akash, logger: cycleLog, reason: err instanceof NoGroupAvailableError ? "no-group" : "orphan",
-            });
-            if (err instanceof NoGroupAvailableError) {
-              cycleLog.warn("group.none-available", { dseq, workspace: account.workspace, ...containment });
-              putStatus = "NO_GROUP";
-              if (notify.notifyPutFailed) {
-                await notify.notifyPutFailed(
-                  { dseq, reason: "no available group", group: null, account, containment },
-                  tg,
-                );
-              }
-            } else {
-              cycleLog.error("lease.orphan", { dseq, account: account.name, error: err.message, ...containment });
-              await notify.notifyLeaseOrphan(
-                { account, dseq, error: err.message, containment },
-                tg,
-              );
-              putStatus = "ORPHAN";
-            }
-          }
-        }
-
-        // 3. inject GROUP_NAME and PUT new SDL (only when we own a group)
-        if (group && sdlTemplate && sdlInjector) {
-          try {
-            const newSdl = sdlInjector.injectGroupName(sdlTemplate, group.name);
-            await akash.updateDeployment({ account, config, logger: cycleLog }, dseq, newSdl);
-            await deploymentsRepoDep.updateStatus(dseq, account.id, "PUT_OK", {
-              group_name: group.name,
-              put_attempts: 1,
-            }).catch((e) => cycleLog.warn("db.deployment.update.failed", { error: e.message }));
             putStatus = "PUT_OK";
-            cycleLog.info("deployment.put.ok", { dseq, group: group.name });
-
-            // 4. Disable console managed-wallet auto-topup. Cost guard.
-            // Non-fatal: if PATCH fails, sweeper retries on its tick.
-            try {
-              await akash.disableAutoTopUp({ account, config, logger: cycleLog }, dseq);
-              await deploymentsRepoDep.markAutoTopUpDisabled(dseq, account.id)
-                .catch((e) => cycleLog.warn("db.deployment.update.failed", { error: e.message }));
-              cycleLog.info("deployment.auto_topup.disabled", { dseq });
-            } catch (err) {
-              cycleLog.warn("deployment.auto_topup.disable.failed", { dseq, error: err.message });
-            }
+            cycleLog.info("deployment.recorded", { dseq, group: group.name });
           } catch (err) {
-            cycleLog.error("deployment.put.failed", { dseq, group: group.name, error: err.message });
-            await deploymentsRepoDep.updateStatus(dseq, account.id, "PUT_FAILED", {
-              group_name: group.name,
-              last_error: err.message,
-              put_attempts: 1,
-            }).catch((e) => cycleLog.warn("db.deployment.update.failed", { error: e.message }));
-            await groupsRepoDep.update(group.name, {
-              status: "PUT_FAILED",
-              last_error: err.message,
-            }).catch((e) => cycleLog.warn("db.group.update.failed", { error: e.message }));
-            if (notify.notifyPutFailed) {
-              await notify.notifyPutFailed(
-                { dseq, reason: err.message, group: group.name, account },
-                tg,
-              );
-            }
-            putStatus = "PUT_FAILED";
+            // Orphan: chain lease succeeded, DB insert failed. Same containment
+            // path as before — try to close on-chain (refunds escrow); if close
+            // fails, disable auto-topup so wallet can't refill the drain.
+            const containment = await containLeasedDeployment({
+              ctx, dseq, akash, logger: cycleLog, reason: "orphan",
+            });
+            cycleLog.error("lease.orphan", {
+              dseq, account: account.name, error: err.message, ...containment,
+            });
+            await notify.notifyLeaseOrphan(
+              { account, dseq, error: err.message, containment },
+              tg,
+            );
+            await releaseGroupSafe(cycleLog, group.name);
+            putStatus = "ORPHAN";
+            // Skip the auto-topup PATCH and 1h hold — there's no row to track.
+            await notify.notifyLeaseSuccess(
+              { bid: result.bid, lease: result.lease, account, group: group.name, putStatus },
+              tg,
+            );
+            await sleep(randomBetween(config.RETRY_MIN_MS, config.RETRY_MAX_MS), abortSignal);
+            continue;
+          }
+
+          // Disable console managed-wallet auto-topup. Cost guard.
+          // Non-fatal: sweeper retries on its tick if this PATCH fails.
+          try {
+            await akash.disableAutoTopUp({ account, config, logger: cycleLog }, dseq);
+            await deploymentsRepoDep.markAutoTopUpDisabled(dseq, account.id)
+              .catch((e) => cycleLog.warn("db.deployment.update.failed", { error: e.message }));
+            cycleLog.info("deployment.auto_topup.disabled", { dseq });
+          } catch (err) {
+            cycleLog.warn("deployment.auto_topup.disable.failed", { dseq, error: err.message });
           }
         }
 
@@ -352,12 +400,15 @@ export async function runAccountLoop(account, deps) {
         continue;
       }
 
+      // No bid matched (or all leases failed). Close the on-chain deployment
+      // (refunds escrow) and release the group so another account can take it.
       try {
         await akash.closeDeployment(ctx, dseq);
         cycleLog.info("deployment.closed", { dseq });
       } catch (err) {
         cycleLog.warn("deployment.close.failed", { dseq, error: err.message });
       }
+      await releaseGroupSafe(cycleLog, group?.name);
 
       noMatchStreak++;
       if (noMatchStreak >= config.NO_MATCH_EXHAUST_THRESHOLD) {

@@ -84,6 +84,75 @@ export async function lockNextAvailable(accountId, dseq, lockHours, workspace, c
   return conn ? run(conn) : withTx(run);
 }
 
+/**
+ * Pre-POST lock with short TTL. Same atomic pick-next-available semantics as
+ * `lockNextAvailable` but leaves `locked_dseq = NULL` (no dseq yet — POST
+ * hasn't happened) and uses a minutes-based TTL so a crash between lock and
+ * lease auto-recovers quickly via the sweeper.
+ *
+ * Promote with `bindLockToDseq` once POST succeeds and lease lands.
+ */
+export async function lockNextAvailablePending(accountId, workspace, pendingMinutes, conn) {
+  const run = async (c) => {
+    const [rows] = await c.query(
+      "SELECT name FROM `groups` WHERE status = 'AVAILABLE' AND workspace = ? ORDER BY name ASC LIMIT 1 FOR UPDATE",
+      [workspace ?? "DEFAULT"],
+    );
+    if (rows.length === 0) return null;
+    const name = rows[0].name;
+    await c.query(
+      `UPDATE \`groups\` SET status = 'LOCKED', locked_by_account_id = ?, locked_dseq = NULL,
+         locked_at = NOW(), expires_at = DATE_ADD(NOW(), INTERVAL ? MINUTE), last_error = NULL
+       WHERE name = ?`,
+      [accountId, pendingMinutes, name],
+    );
+    const [updated] = await c.query(
+      `SELECT ${COLS} FROM \`groups\` WHERE name = ?`,
+      [name],
+    );
+    return updated[0] ?? null;
+  };
+  return conn ? run(conn) : withTx(run);
+}
+
+/**
+ * Promote a pending lock (set by `lockNextAvailablePending`) to the full
+ * post-lease state: bind the dseq and extend `expires_at` to `lockHours`.
+ *
+ * Guard: throws DbError if the row is not currently LOCKED with NULL dseq.
+ * That state means the caller is misusing this method (e.g. promoting a
+ * lock that already has a dseq, or a row that is not locked).
+ */
+export async function bindLockToDseq(name, dseq, lockHours, conn) {
+  const run = async (c) => {
+    const [rows] = await c.query(
+      "SELECT status, locked_dseq FROM `groups` WHERE name = ? FOR UPDATE",
+      [name],
+    );
+    if (rows.length === 0) {
+      throw new DbError(`groups.bindLockToDseq: group "${name}" not found`);
+    }
+    const row = rows[0];
+    if (row.status !== "LOCKED" || row.locked_dseq != null) {
+      throw new DbError(
+        `groups.bindLockToDseq: "${name}" not in pending state (status=${row.status}, locked_dseq=${row.locked_dseq ?? "NULL"})`,
+      );
+    }
+    await c.query(
+      `UPDATE \`groups\` SET locked_dseq = ?,
+         expires_at = DATE_ADD(NOW(), INTERVAL ? HOUR)
+       WHERE name = ?`,
+      [String(dseq), lockHours, name],
+    );
+    const [updated] = await c.query(
+      `SELECT ${COLS} FROM \`groups\` WHERE name = ?`,
+      [name],
+    );
+    return updated[0] ?? null;
+  };
+  return conn ? run(conn) : withTx(run);
+}
+
 export async function release(name) {
   await query(
     `UPDATE \`groups\` SET status = 'AVAILABLE', locked_by_account_id = NULL,

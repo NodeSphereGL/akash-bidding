@@ -59,8 +59,7 @@ export async function withTx(fn) {
   } catch (err) {
     try { await conn.rollback(); } catch { /* ignore */ }
     // Only wrap mysql-driver errors. Domain errors thrown by the callback
-    // (e.g. NoGroupAvailableError) must keep their identity so callers can
-    // branch on instanceof.
+    // must keep their identity so callers can branch on instanceof.
     if (err && err.sqlState) {
       throw new DbError(`db.tx.failed: ${err.message}`, err);
     }

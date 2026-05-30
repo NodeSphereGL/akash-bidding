@@ -188,9 +188,14 @@ export async function closeDeployment(ctx, dseq) {
 }
 
 /**
- * PUT /v1/deployments/{dseq} with new SDL string. Used to inject GROUP_NAME
- * post-lease so the deployed image picks the right group. Returns the
- * unwrapped response body on success; throws AkashApiError on non-2xx.
+ * PUT /v1/deployments/{dseq} with new SDL string.
+ *
+ * No longer called by `runAccountLoop` — the orchestrator now POSTs the SDL
+ * with the real GROUP_NAME baked in (lock-before-POST flow), eliminating the
+ * post-lease PUT and the 2nd ReplicaSet it would cause on the provider.
+ *
+ * Retained for ops tooling (e.g. manual SDL refresh for a stuck lease).
+ * Returns the unwrapped response body; throws AkashApiError on non-2xx.
  */
 export async function updateDeployment(ctx, dseq, sdl) {
   const body = await request(
