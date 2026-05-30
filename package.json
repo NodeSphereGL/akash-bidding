@@ -16,6 +16,7 @@
     "db:migrate": "node scripts/db-migrate.js",
     "db:seed-groups": "node scripts/db-seed-groups.js",
     "db:import-accounts": "node scripts/db-import-accounts.js",
+    "db:sync-live": "node scripts/ops/sync-live-deployments.js",
     "test": "node --test tests/*.test.js"
   },
   "dependencies": {
