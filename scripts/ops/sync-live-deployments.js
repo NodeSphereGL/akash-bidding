@@ -1,21 +1,22 @@
 #!/usr/bin/env node
 // Reconcile live console-api deployment state into the local `deployments`
-// table. Two-phase:
-//   1) Fetch active deployments per enabled account in parallel.
-//   2) Dedupe per (owner, dseq) — multiple api-keys can see the same wallet's
-//      deployments. Pick the lowest account.id as the canonical owner of the
-//      local row; upsert that; delete non-canonical (account_id, dseq) rows.
+// table. Per-account fetch + simple upsert.
 //
-// Does NOT lock groups, does NOT flip missing rows to CLOSED — sweeper handles
-// expiry and group locks must be operator-controlled.
+// Filter: only deployments with a non-empty `leases` array — a deployment
+// without a lease is not consuming a managed-wallet position and there's
+// nothing for the daemon to manage. The bidder will pick those up in its
+// normal cycle.
 //
-// Usage:
-//   node scripts/ops/sync-live-deployments.js [--dry-run] [--account=NAME] [--limit=N]
+// Uniqueness: (account_id, dseq) — the schema's existing UNIQUE key. If two
+// api-keys see the same wallet's deployment, each gets its own row. That's
+// by design: each row represents "this api-key can manage this deployment".
 //
 // expires_at = (lease/deployment block-height converted via chain anchor) +
 // GROUP_LOCK_HOURS. Rows missing a parseable created_at are skipped with a
-// warning so the operator can investigate manually instead of inheriting a
-// wrong expiry.
+// warning so we never inherit a wrong expiry.
+//
+// Usage:
+//   node scripts/ops/sync-live-deployments.js [--dry-run] [--account=NAME] [--limit=N]
 
 import "dotenv/config";
 import { fetch } from "undici";
@@ -42,61 +43,39 @@ function unwrap(body) {
   return body && typeof body === "object" && "data" in body ? body.data : body;
 }
 
-// Akash chain DeploymentState enum: invalid=0, active=1, closed=2.
-// console-api may serialize it as a number, a string, or the bare enum name.
-function isActive(d) {
-  const state = d?.deployment?.state ?? d?.state;
-  if (state == null) return true;
-  if (typeof state === "number") return state === 1;
-  if (typeof state === "string") return /^active$/i.test(state) || state === "1";
-  return true;
+function hasLease(d) {
+  const leases = d?.leases ?? d?.deployment?.leases;
+  return Array.isArray(leases) && leases.length > 0;
 }
 
 function extractDseq(d) {
-  return (
-    d?.deployment?.deployment_id?.dseq ??
-    d?.deployment?.id?.dseq ??
-    d?.deployment_id?.dseq ??
-    d?.id?.dseq ??
-    d?.dseq ??
-    null
-  );
+  return d?.deployment?.id?.dseq ?? d?.id?.dseq ?? d?.dseq ?? null;
 }
 
 function extractOwner(d) {
-  return (
-    d?.deployment?.deployment_id?.owner ??
-    d?.deployment?.id?.owner ??
-    d?.deployment_id?.owner ??
-    d?.id?.owner ??
-    d?.owner ??
-    null
-  );
+  return d?.deployment?.id?.owner ?? d?.id?.owner ?? d?.owner ?? null;
 }
 
 function extractProvider(d) {
   const leases = d?.leases ?? d?.deployment?.leases ?? [];
   for (const l of leases) {
-    const p = l?.id?.provider ?? l?.lease?.lease_id?.provider ?? l?.lease_id?.provider ?? l?.provider;
+    const p = l?.id?.provider ?? l?.provider;
     if (p) return p;
   }
   return null;
 }
 
-// console-api stores `created_at` as a block-height string (not a wall-clock
-// timestamp). Prefer the first lease's created_at — that's "in use" start —
-// otherwise fall back to the deployment's own created_at.
+// console-api stores `created_at` as a block-height string. Prefer the first
+// lease's created_at (closer to "in use" start), else the deployment's.
 function extractLeasedHeight(d) {
-  const leaseHeight = d?.leases?.[0]?.created_at ?? d?.leases?.[0]?.lease?.created_at;
-  const depHeight = d?.deployment?.created_at ?? d?.created_at;
+  const leaseHeight = d?.leases?.[0]?.created_at;
+  const depHeight = d?.deployment?.created_at;
   const raw = leaseHeight ?? depHeight;
   if (raw == null) return null;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-// Linear height → wall-clock using a single chain anchor. Drift bounded by
-// AVG_BLOCK_TIME_SECONDS variance — fine for 24h expiry math.
 function heightToDate(height, anchor) {
   const ms = anchor.timeMs - (anchor.height - height) * AVG_BLOCK_TIME_SECONDS * 1000;
   return new Date(ms);
@@ -140,73 +119,11 @@ async function listLive(ctx, pageSize) {
   return out;
 }
 
-async function fetchAccount(account, config, limit) {
-  const ctx = { account, config, logger: { warn: () => {}, info: () => {} } };
-  const result = { account, raw: [], error: null };
-  try {
-    result.raw = await listLive(ctx, limit);
-  } catch (err) {
-    result.error = `${err.status ?? ""} ${err.message}`.trim();
-  }
-  return result;
-}
-
-// Normalize one API row to a candidate record. Returns null if the row is
-// closed / missing required fields — caller increments skip counters.
-function normalize(account, d, anchor, lockHoursMs) {
-  if (!isActive(d)) return { skip: "inactive" };
-  const dseq = extractDseq(d);
-  if (!dseq) return { skip: "no_dseq" };
-  const owner = extractOwner(d);
-  if (!owner) return { skip: "no_owner", dseq };
-  const height = extractLeasedHeight(d);
-  if (height == null) return { skip: "no_created_at", dseq };
-  const leasedAt = heightToDate(height, anchor);
-  const expiresAt = new Date(leasedAt.getTime() + lockHoursMs);
-  return {
-    dseq: String(dseq),
-    owner,
-    provider: extractProvider(d),
-    leasedAt,
-    expiresAt,
-    seenBy: account.id,
-  };
-}
-
-// Pick canonical account per (owner, dseq): lowest account.id among accounts
-// that observed the row. Deterministic + matches the existing daemon's
-// natural account ordering (lockNextAvailable uses ORDER BY name ASC, but
-// for sync-live we use id since it's stable across rename).
-function dedupe(perAccount) {
-  const map = new Map(); // key = owner + '|' + dseq
-  for (const { account, candidates } of perAccount) {
-    for (const c of candidates) {
-      const key = `${c.owner}|${c.dseq}`;
-      const prev = map.get(key);
-      if (!prev || account.id < prev.canonicalAccountId) {
-        map.set(key, {
-          owner: c.owner,
-          dseq: c.dseq,
-          provider: c.provider ?? prev?.provider ?? null,
-          leasedAt: c.leasedAt,
-          expiresAt: c.expiresAt,
-          canonicalAccountId: account.id,
-          canonicalAccountName: account.name,
-          seenByAccountIds: prev ? [...new Set([...prev.seenByAccountIds, account.id])] : [account.id],
-        });
-      } else {
-        prev.seenByAccountIds = [...new Set([...prev.seenByAccountIds, account.id])];
-        prev.provider = prev.provider ?? c.provider ?? null;
-      }
-    }
-  }
-  return [...map.values()];
-}
-
-async function upsertCanonical({ canonicalAccountId, owner, dseq, provider, leasedAt, expiresAt }) {
-  // INSERT new row, or refresh an old terminal row back to LEASED + record
-  // the wallet owner. Never downgrade a healthier status (PUT_OK stays
-  // PUT_OK; PUT_FAILED stays PUT_FAILED so the nag continues).
+// INSERT new row, or refresh metadata on the existing (account_id, dseq) row.
+// Never downgrade a healthier status — PUT_OK / PUT_FAILED stay (the daemon
+// or sweeper owns those state transitions). CLOSED/EXPIRED get promoted back
+// to LEASED if the deployment is alive again on Akash.
+async function upsert({ accountId, dseq, owner, provider, leasedAt, expiresAt }) {
   const result = await query(
     `INSERT INTO deployments
        (dseq, account_id, owner, provider, status, leased_at, expires_at)
@@ -217,22 +134,65 @@ async function upsertCanonical({ canonicalAccountId, owner, dseq, provider, leas
        provider   = COALESCE(provider, VALUES(provider)),
        leased_at  = COALESCE(leased_at, VALUES(leased_at)),
        expires_at = VALUES(expires_at)`,
-    [dseq, canonicalAccountId, owner, provider, leasedAt, expiresAt],
+    [String(dseq), accountId, owner, provider, leasedAt, expiresAt],
   );
-  return result.affectedRows;
+  return result.affectedRows; // 1 = insert, 2 = update, 0 = no change
 }
 
-// Remove non-canonical shared-wallet rows. Constrained to LEASED status so
-// we never delete a row that a daemon loop has progressed past initial
-// import (PUT_OK / PUT_FAILED / CLOSED / EXPIRED are preserved).
-async function deleteNonCanonical({ owner, dseq, canonicalAccountId }) {
-  const result = await query(
-    `DELETE FROM deployments
-     WHERE dseq = ? AND account_id <> ? AND status = 'LEASED'
-       AND (owner = ? OR owner IS NULL)`,
-    [dseq, canonicalAccountId, owner],
-  );
-  return result.affectedRows;
+async function syncAccount(account, config, anchor, { dryRun, limit }) {
+  const ctx = { account, config, logger: { warn: () => {}, info: () => {} } };
+  const stats = {
+    account: account.name, fetched: 0, withLease: 0,
+    inserted: 0, updated: 0, skipped: 0, error: null,
+  };
+
+  let live;
+  try {
+    live = await listLive(ctx, limit);
+  } catch (err) {
+    stats.error = `${err.status ?? ""} ${err.message}`.trim();
+    return stats;
+  }
+  stats.fetched = live.length;
+
+  const lockHoursMs = config.GROUP_LOCK_HOURS * 3600 * 1000;
+
+  for (const d of live) {
+    if (!hasLease(d)) continue;
+    stats.withLease++;
+
+    const dseq = extractDseq(d);
+    if (!dseq) {
+      stats.skipped++;
+      console.warn(`[sync-live] ${account.name}: row missing dseq — skipped`);
+      continue;
+    }
+    const height = extractLeasedHeight(d);
+    if (height == null) {
+      stats.skipped++;
+      console.warn(`[sync-live] ${account.name} dseq=${dseq}: no created_at block-height — skipped`);
+      continue;
+    }
+    const leasedAt = heightToDate(height, anchor);
+    const expiresAt = new Date(leasedAt.getTime() + lockHoursMs);
+    const owner = extractOwner(d);
+    const provider = extractProvider(d);
+
+    if (dryRun) {
+      console.log(
+        `[dry-run] ${account.name} dseq=${dseq} owner=${owner?.slice(0, 14) ?? "-"}… provider=${provider ?? "-"} expires=${expiresAt.toISOString()}`,
+      );
+      stats.inserted++;
+      continue;
+    }
+
+    const affected = await upsert({ accountId: account.id, dseq, owner, provider, leasedAt, expiresAt });
+    if (affected >= 2) stats.updated++;
+    else if (affected === 1) stats.inserted++;
+    // 0 = row identical to current — not counted
+  }
+
+  return stats;
 }
 
 async function runConcurrent(items, limit, worker) {
@@ -280,85 +240,30 @@ async function main() {
     await closePool();
     process.exit(1);
   }
+
   console.log(
     `[sync-live] dry_run=${args.dryRun} accounts=${accounts.length} limit=${args.limit} concurrency=${CONCURRENCY} lock_hours=${config.GROUP_LOCK_HOURS} chain_anchor=height=${anchor.height} time=${new Date(anchor.timeMs).toISOString()}`,
   );
 
-  // --- phase 1: fetch live state per account ---
-  const fetchResults = await runConcurrent(accounts, CONCURRENCY, (a) =>
-    fetchAccount(a, config, args.limit),
+  const results = await runConcurrent(accounts, CONCURRENCY, (a) =>
+    syncAccount(a, config, anchor, args),
   );
 
-  // --- phase 2: normalize + bucket by account ---
-  const lockHoursMs = config.GROUP_LOCK_HOURS * 3600 * 1000;
-  const perAccount = [];
-  const accountStats = new Map();
-  for (const r of fetchResults) {
-    const stat = { account: r.account.name, fetched: r.raw.length, active: 0, skipped: 0, error: r.error };
-    accountStats.set(r.account.id, stat);
-    if (r.error) { perAccount.push({ account: r.account, candidates: [] }); continue; }
-    const candidates = [];
-    for (const d of r.raw) {
-      const n = normalize(r.account, d, anchor, lockHoursMs);
-      if (n.skip === "inactive") continue;
-      if (n.skip) {
-        stat.skipped++;
-        console.warn(`[sync-live] ${r.account.name} ${n.skip}${n.dseq ? ` dseq=${n.dseq}` : ""} — skipped`);
-        continue;
-      }
-      stat.active++;
-      candidates.push(n);
-    }
-    perAccount.push({ account: r.account, candidates });
-  }
-
-  // --- phase 3: dedupe by (owner, dseq) ---
-  const canonicalRows = dedupe(perAccount);
-  const sharedRows = canonicalRows.filter((r) => r.seenByAccountIds.length > 1);
-  console.log(
-    `\n[sync-live] dedupe: ${canonicalRows.length} unique (owner,dseq) tuples; ${sharedRows.length} shared across multiple accounts`,
-  );
-  for (const r of sharedRows) {
-    const names = r.seenByAccountIds.map((id) => {
-      const acc = accounts.find((a) => a.id === id);
-      return acc?.name ?? `id=${id}`;
-    });
-    console.log(
-      `  shared: dseq=${r.dseq} owner=${r.owner.slice(0, 14)}… seen_by=[${names.join(", ")}] canonical=${r.canonicalAccountName}`,
-    );
-  }
-
-  // --- phase 4: write canonical rows + remove non-canonical duplicates ---
-  let inserted = 0, updated = 0, deleted = 0;
-  for (const row of canonicalRows) {
-    if (args.dryRun) {
-      console.log(
-        `[dry-run] upsert canonical: account=${row.canonicalAccountName} dseq=${row.dseq} owner=${row.owner.slice(0, 14)}… expires=${row.expiresAt.toISOString()}`,
-      );
+  console.log("\n[sync-live] per-account summary:");
+  let totIns = 0, totUpd = 0, totSkip = 0, totErr = 0;
+  for (const r of results) {
+    if (r.error) {
+      console.log(`  ${pad(r.account, 24)} ERROR: ${r.error}`);
+      totErr++;
       continue;
     }
-    const affected = await upsertCanonical(row);
-    if (affected >= 2) updated++;
-    else if (affected === 1) inserted++;
-
-    if (row.seenByAccountIds.length > 1) {
-      const removed = await deleteNonCanonical(row);
-      if (removed > 0) {
-        deleted += removed;
-        console.log(
-          `[sync-live] deduped: dseq=${row.dseq} removed ${removed} non-canonical LEASED row(s); kept account=${row.canonicalAccountName}`,
-        );
-      }
-    }
-  }
-
-  console.log("\n[sync-live] per-account fetch summary:");
-  for (const [, s] of accountStats) {
-    if (s.error) console.log(`  ${pad(s.account, 24)} ERROR: ${s.error}`);
-    else console.log(`  ${pad(s.account, 24)} fetched=${s.fetched} active=${s.active} skipped=${s.skipped}`);
+    console.log(
+      `  ${pad(r.account, 24)} fetched=${r.fetched} with_lease=${r.withLease} inserted=${r.inserted} updated=${r.updated} skipped=${r.skipped}`,
+    );
+    totIns += r.inserted; totUpd += r.updated; totSkip += r.skipped;
   }
   console.log(
-    `\n[sync-live] write totals: inserted=${inserted} updated=${updated} deleted_non_canonical=${deleted} dry_run=${args.dryRun}`,
+    `\n[sync-live] totals: inserted=${totIns} updated=${totUpd} skipped=${totSkip} errors=${totErr} dry_run=${args.dryRun}`,
   );
 
   await closePool();
