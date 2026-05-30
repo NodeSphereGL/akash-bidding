@@ -124,7 +124,7 @@ GET    /v1/deployments[?account_id=&status=&limit=]
 GET    /v1/deployments/:dseq
 ```
 
-Bound to `API_HOST=127.0.0.1` only. No auth — SSH-tunnel from outside if remote admin is required. See `docs/api-examples.md` for curl examples and `docs/group-management.md` for the PUT_FAILED runbook.
+Hard-bound to `127.0.0.1` (not configurable). No auth — SSH-tunnel from outside if remote admin is required. See `docs/api-examples.md` for curl examples and `docs/group-management.md` for the PUT_FAILED runbook.
 
 ## Calibrate the price cap
 

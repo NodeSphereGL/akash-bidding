@@ -19,11 +19,10 @@ const NOTIFY_RELEASE_THRESHOLD = 3;
 // Alert once if auto-topup is still ON > 1h after lease — escrow may refill.
 const AUTO_TOPUP_ALERT_THRESHOLD_MS = 60 * 60 * 1000;
 
-export function startSweeper({ config, logger, notify, groupsRepo, deploymentsRepo, accounts, akash, abortSignal }) {
+export function startSweeper({ config, logger, notify, groupsRepo, deploymentsRepo, accountsRepo, akash, abortSignal }) {
   const log = logger.child({ component: "sweeper" });
   log.info("sweeper.start", { intervalMs: config.SWEEP_INTERVAL_MS });
 
-  const accountsById = new Map((accounts ?? []).map((a) => [a.id, a]));
   const alertedDseqs = new Set();
 
   let running = false;
@@ -31,6 +30,17 @@ export function startSweeper({ config, logger, notify, groupsRepo, deploymentsRe
 
   async function retryAutoTopUp(now) {
     if (!akash?.disableAutoTopUp || !deploymentsRepo?.listPendingAutoTopUp) return { tried: 0, ok: 0, alerted: 0 };
+    // Refresh accounts every tick via listAll (not listEnabled) — a disabled
+    // account whose deployments are still on-chain must still have its
+    // auto-topup PATCH retried, else the wallet keeps refilling escrow.
+    let accountsById;
+    try {
+      const rows = await accountsRepo.listAll();
+      accountsById = new Map(rows.map((a) => [a.id, a]));
+    } catch (e) {
+      log.error("sweeper.accounts.list.failed", { error: e.message });
+      return { tried: 0, ok: 0, alerted: 0 };
+    }
     let rows;
     try {
       rows = await deploymentsRepo.listPendingAutoTopUp(50);
@@ -41,7 +51,11 @@ export function startSweeper({ config, logger, notify, groupsRepo, deploymentsRe
     let tried = 0, ok = 0, alerted = 0;
     for (const row of rows) {
       const account = accountsById.get(row.account_id);
-      if (!account) continue; // account was removed/disabled — leave row pending
+      if (!account) {
+        // Account row deleted entirely — no apiKey to retry with.
+        log.warn("sweeper.auto_topup.account_missing", { dseq: row.dseq, accountId: row.account_id });
+        continue;
+      }
       tried++;
       try {
         await akash.disableAutoTopUp({ account, config, logger: log }, row.dseq);

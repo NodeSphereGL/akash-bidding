@@ -92,7 +92,7 @@ export function loadConfig() {
     SWEEP_INTERVAL_MS: int("SWEEP_INTERVAL_MS", 300_000),
     PUT_NAG_INTERVAL_MS: int("PUT_NAG_INTERVAL_MS", 1_800_000),
 
-    API_HOST: str("API_HOST", "127.0.0.1"),
+    // Admin API bind is hard-coded to 127.0.0.1 in api/server.js — no override.
     API_PORT: int("API_PORT", 8088),
   };
 

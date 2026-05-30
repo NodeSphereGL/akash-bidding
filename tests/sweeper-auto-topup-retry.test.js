@@ -50,7 +50,7 @@ test("sweeper.auto_topup: PATCH ok → marks row + logs retry.ok", async () => {
   const abort = new AbortController();
   const sw = startSweeper({
     config: baseConfig, logger, notify: { notifyPutFailedNag: async () => {}, notifySweepRelease: async () => {} },
-    groupsRepo: fakeGroupsRepo(), deploymentsRepo, accounts, akash, abortSignal: abort.signal,
+    groupsRepo: fakeGroupsRepo(), deploymentsRepo, accountsRepo: { listAll: async () => accounts }, akash, abortSignal: abort.signal,
   });
   await sw.tick();
   sw.stop();
@@ -84,7 +84,8 @@ test("sweeper.auto_topup: PATCH fails fresh row → warn but NO alert (under 1h)
 
   const sw = startSweeper({
     config: baseConfig, logger, notify,
-    groupsRepo: fakeGroupsRepo(), deploymentsRepo, accounts, akash,
+    groupsRepo: fakeGroupsRepo(), deploymentsRepo,
+    accountsRepo: { listAll: async () => accounts }, akash,
     abortSignal: new AbortController().signal,
   });
   await sw.tick();
@@ -118,7 +119,8 @@ test("sweeper.auto_topup: PATCH fails > 1h → fires notifyLeaseOrphan exactly o
 
   const sw = startSweeper({
     config: baseConfig, logger, notify,
-    groupsRepo: fakeGroupsRepo(), deploymentsRepo, accounts, akash,
+    groupsRepo: fakeGroupsRepo(), deploymentsRepo,
+    accountsRepo: { listAll: async () => accounts }, akash,
     abortSignal: new AbortController().signal,
   });
   await sw.tick();
@@ -130,7 +132,7 @@ test("sweeper.auto_topup: PATCH fails > 1h → fires notifyLeaseOrphan exactly o
   assert.match(notifyCalls[0].error, /auto-topup disable still failing/);
 });
 
-test("sweeper.auto_topup: row whose account is no longer enabled is skipped", async () => {
+test("sweeper.auto_topup: row whose account row is missing (deleted) is skipped + warned", async () => {
   const { logger, lines } = fakeLogger();
   const markCalls = [];
   const deploymentsRepo = {
@@ -140,12 +142,13 @@ test("sweeper.auto_topup: row whose account is no longer enabled is skipped", as
   };
   let patchCalled = false;
   const akash = { disableAutoTopUp: async () => { patchCalled = true; } };
-  const accounts = [{ id: 1, name: "alpha" }]; // account_id 99 not in this list
+  const accounts = [{ id: 1, name: "alpha" }]; // account_id 99 deleted from DB
 
   const sw = startSweeper({
     config: baseConfig, logger,
     notify: { notifyPutFailedNag: async () => {}, notifySweepRelease: async () => {} },
-    groupsRepo: fakeGroupsRepo(), deploymentsRepo, accounts, akash,
+    groupsRepo: fakeGroupsRepo(), deploymentsRepo,
+    accountsRepo: { listAll: async () => accounts }, akash,
     abortSignal: new AbortController().signal,
   });
   await sw.tick();
@@ -153,6 +156,38 @@ test("sweeper.auto_topup: row whose account is no longer enabled is skipped", as
 
   assert.equal(patchCalled, false);
   assert.equal(markCalls.length, 0);
+  const warn = lines.find((l) => l.event === "sweeper.auto_topup.account_missing");
+  assert.ok(warn, "must warn when account row is gone");
   const done = lines.find((l) => l.event === "sweeper.cycle.done");
   assert.equal(done.autoTopUp.tried, 0);
+});
+
+test("sweeper.auto_topup: row whose account is DISABLED but still in DB still gets PATCHed", async () => {
+  // H3 regression: previously the sweeper loaded accounts via listEnabled at
+  // startup, so disabling an account stranded its auto-topup retries and
+  // escrow kept refilling. Sweeper now uses listAll per tick.
+  const { logger, lines } = fakeLogger();
+  const recentMark = [];
+  const deploymentsRepo = {
+    expireDue: async () => 0,
+    listPendingAutoTopUp: async () => [{ dseq: "500", account_id: 7, leased_at: new Date() }],
+    markAutoTopUpDisabled: async (dseq, id) => { recentMark.push([dseq, id]); },
+  };
+  const akash = { disableAutoTopUp: async () => ({ ok: true }) };
+  // Account 7 is disabled but still present in the DB.
+  const accounts = [{ id: 7, name: "disabled-but-present", apiKey: "k", proxy: null, enabled: false }];
+
+  const sw = startSweeper({
+    config: baseConfig, logger,
+    notify: { notifyPutFailedNag: async () => {}, notifySweepRelease: async () => {} },
+    groupsRepo: fakeGroupsRepo(), deploymentsRepo,
+    accountsRepo: { listAll: async () => accounts }, akash,
+    abortSignal: new AbortController().signal,
+  });
+  await sw.tick();
+  sw.stop();
+
+  assert.deepEqual(recentMark, [["500", 7]], "PATCH retried even though account is disabled");
+  const ok = lines.find((l) => l.event === "sweeper.auto_topup.retry.ok");
+  assert.ok(ok, "must log retry.ok for disabled account");
 });

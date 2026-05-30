@@ -105,19 +105,30 @@ export async function notifyPutFailedNag(group, cfg) {
   return sendTelegram(msg, cfg);
 }
 
-export async function notifyLeaseOrphan({ account, dseq, error }, cfg) {
-  const msg = [
-    "🛑 <b>LEASE ORPHAN — chain lease succeeded but DB tx failed</b>",
+export async function notifyLeaseOrphan({ account, dseq, error, containment }, cfg) {
+  const closed = containment?.closed === true;
+  const autoTopUp = containment?.autoTopUpDisabled === true
+    ? "DISABLED (escrow cannot refill)"
+    : closed
+      ? "n/a (deployment closed)"
+      : "STILL ON ⚠️ — wallet may keep refilling escrow";
+  const lines = [
+    "🛑 <b>LEASE ORPHAN — chain lease succeeded but post-lease failed</b>",
     `<code>${new Date().toISOString()}</code>`,
     "",
     `Account: <b>${htmlEscape(account?.name ?? "?")}</b>`,
     `dseq: <code>${htmlEscape(dseq ?? "?")}</code>`,
     `Error: ${htmlEscape(error ?? "unknown")}`,
+    `Auto-close: <b>${closed ? "OK (escrow refunded)" : "FAILED"}</b>`,
+    `Auto-topup: <b>${htmlEscape(autoTopUp)}</b>`,
     "",
-    "Akash is accruing cost on this deployment with no local record.",
-    "Action: close via console UI or scripts/ops/close-test-leases.js.",
-  ].join("\n");
-  return sendTelegram(msg, cfg);
+  ];
+  lines.push(
+    closed
+      ? "Deployment closed automatically. Investigate the DB error and resume."
+      : "Action: close via console UI or scripts/ops/close-test-leases.js.",
+  );
+  return sendTelegram(lines.join("\n"), cfg);
 }
 
 export async function notifySweepRelease(count, cfg) {

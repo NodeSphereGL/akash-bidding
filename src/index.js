@@ -31,6 +31,7 @@ import * as notifyImpl from "./notify.js";
 import * as sdlMod from "./sdl.js";
 import * as groupsRepo from "./db/repo/groups.js";
 import * as deploymentsRepo from "./db/repo/deployments.js";
+import * as accountsRepo from "./db/repo/accounts.js";
 import { createPool, closePool, ping as dbPing } from "./db/pool.js";
 import { postLeaseAtomic } from "./post-lease.js";
 import { NoGroupAvailableError } from "./errors.js";
@@ -127,6 +128,33 @@ async function pollAndLease({ ctx, dseq, owner, manifest, config, logger, akash,
 
 function addHours(date, hours) {
   return new Date(date.getTime() + hours * 3600_000);
+}
+
+// Stop the bleed when we have an on-chain lease we cannot run a workload on
+// (no group available, or DB tx failed after lease success). Tries DELETE
+// first — refunds remaining escrow. If close fails, PATCH auto-topup off as
+// backstop so the wallet can't keep refilling a draining escrow. Always
+// resolves with status flags; never throws.
+async function containLeasedDeployment({ ctx, dseq, akash, logger, reason }) {
+  let closed = false;
+  let autoTopUpDisabled = false;
+  try {
+    await akash.closeDeployment(ctx, dseq);
+    closed = true;
+    logger.info("containment.close.ok", { dseq, reason });
+  } catch (err) {
+    logger.error("containment.close.failed", { dseq, reason, error: err.message });
+  }
+  if (!closed) {
+    try {
+      await akash.disableAutoTopUp(ctx, dseq);
+      autoTopUpDisabled = true;
+      logger.warn("containment.auto_topup.disabled", { dseq, reason });
+    } catch (err) {
+      logger.error("containment.auto_topup.disable.failed", { dseq, reason, error: err.message });
+    }
+  }
+  return { closed, autoTopUpDisabled };
 }
 
 /**
@@ -245,20 +273,28 @@ export async function runAccountLoop(account, deps) {
             });
             group = r.group;
           } catch (err) {
+            // Either branch: lease succeeded on-chain but we cannot run a
+            // workload. Stop the bleed immediately — close on-chain (terminates
+            // lease, returns escrow) and as backstop disable auto-topup so
+            // managed wallet can't refill drained escrow if close fails.
+            const containment = await containLeasedDeployment({
+              ctx, dseq, akash, logger: cycleLog, reason: err instanceof NoGroupAvailableError ? "no-group" : "orphan",
+            });
             if (err instanceof NoGroupAvailableError) {
-              cycleLog.warn("group.none-available", { dseq, workspace: account.workspace });
+              cycleLog.warn("group.none-available", { dseq, workspace: account.workspace, ...containment });
               putStatus = "NO_GROUP";
               if (notify.notifyPutFailed) {
                 await notify.notifyPutFailed(
-                  { dseq, reason: "no available group", group: null, account },
+                  { dseq, reason: "no available group", group: null, account, containment },
                   tg,
                 );
               }
             } else {
-              // Lease succeeded on-chain but DB tx failed → no row, no lock.
-              // Operator must close the on-chain deployment manually.
-              cycleLog.error("lease.orphan", { dseq, account: account.name, error: err.message });
-              await notify.notifyLeaseOrphan({ account, dseq, error: err.message }, tg);
+              cycleLog.error("lease.orphan", { dseq, account: account.name, error: err.message, ...containment });
+              await notify.notifyLeaseOrphan(
+                { account, dseq, error: err.message, containment },
+                tg,
+              );
               putStatus = "ORPHAN";
             }
           }
@@ -417,7 +453,7 @@ async function main() {
 
   startSweeper({
     config, logger, notify: notifyImpl, groupsRepo, deploymentsRepo,
-    accounts, akash: akashImpl,
+    accountsRepo, akash: akashImpl,
     abortSignal: abortController.signal,
   });
 
