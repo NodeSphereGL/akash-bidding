@@ -139,11 +139,48 @@ async function upsert({ accountId, dseq, owner, provider, leasedAt, expiresAt })
   return result.affectedRows; // 1 = insert, 2 = update, 0 = no change
 }
 
-async function syncAccount(account, config, anchor, { dryRun, limit }) {
+// Close LEASED rows for this account whose dseq disappeared from the live
+// API. Conservative guards:
+//   - status='LEASED' only — never touches PUT_OK / PUT_FAILED (daemon owns
+//     those once it has set group_name).
+//   - group_name IS NULL — skip rows the daemon has progressed past insert.
+//   - created_at < scanStart — never flip rows that the daemon may have just
+//     inserted *during* this script's run.
+async function reconcileClosed({ accountId, liveDseqs, scanStart, dryRun }) {
+  const notInLive = liveDseqs.length > 0
+    ? `AND dseq NOT IN (${liveDseqs.map(() => "?").join(",")})`
+    : "";
+  const params = [accountId, scanStart, ...liveDseqs];
+
+  if (dryRun) {
+    const rows = await query(
+      `SELECT id, dseq FROM deployments
+       WHERE account_id = ?
+         AND status = 'LEASED'
+         AND group_name IS NULL
+         AND created_at < ?
+         ${notInLive}`,
+      params,
+    );
+    return { affected: rows.length, dseqs: rows.map((r) => r.dseq) };
+  }
+  const result = await query(
+    `UPDATE deployments SET status = 'CLOSED'
+     WHERE account_id = ?
+       AND status = 'LEASED'
+       AND group_name IS NULL
+       AND created_at < ?
+       ${notInLive}`,
+    params,
+  );
+  return { affected: result.affectedRows, dseqs: [] };
+}
+
+async function syncAccount(account, config, anchor, scanStart, { dryRun, limit }) {
   const ctx = { account, config, logger: { warn: () => {}, info: () => {} } };
   const stats = {
     account: account.name, fetched: 0, withLease: 0,
-    inserted: 0, updated: 0, skipped: 0, error: null,
+    inserted: 0, updated: 0, closed: 0, skipped: 0, error: null,
   };
 
   let live;
@@ -156,6 +193,7 @@ async function syncAccount(account, config, anchor, { dryRun, limit }) {
   stats.fetched = live.length;
 
   const lockHoursMs = config.GROUP_LOCK_HOURS * 3600 * 1000;
+  const liveDseqs = [];
 
   for (const d of live) {
     if (!hasLease(d)) continue;
@@ -173,6 +211,8 @@ async function syncAccount(account, config, anchor, { dryRun, limit }) {
       console.warn(`[sync-live] ${account.name} dseq=${dseq}: no created_at block-height — skipped`);
       continue;
     }
+    liveDseqs.push(String(dseq));
+
     const leasedAt = heightToDate(height, anchor);
     const expiresAt = new Date(leasedAt.getTime() + lockHoursMs);
     const owner = extractOwner(d);
@@ -190,6 +230,20 @@ async function syncAccount(account, config, anchor, { dryRun, limit }) {
     if (affected >= 2) stats.updated++;
     else if (affected === 1) stats.inserted++;
     // 0 = row identical to current — not counted
+  }
+
+  // Two-way reconcile: close stale LEASED rows for this account.
+  const closeRes = await reconcileClosed({
+    accountId: account.id,
+    liveDseqs,
+    scanStart,
+    dryRun,
+  });
+  stats.closed = closeRes.affected;
+  if (dryRun && closeRes.dseqs.length > 0) {
+    console.log(
+      `[dry-run] ${account.name} would CLOSE stale dseqs: ${closeRes.dseqs.join(", ")}`,
+    );
   }
 
   return stats;
@@ -241,16 +295,21 @@ async function main() {
     process.exit(1);
   }
 
+  // Freeze the cutoff timestamp so reconcileClosed never touches rows the
+  // daemon may have inserted *after* this script started — those rows are
+  // by definition newer than our world-view snapshot.
+  const scanStart = new Date();
+
   console.log(
-    `[sync-live] dry_run=${args.dryRun} accounts=${accounts.length} limit=${args.limit} concurrency=${CONCURRENCY} lock_hours=${config.GROUP_LOCK_HOURS} chain_anchor=height=${anchor.height} time=${new Date(anchor.timeMs).toISOString()}`,
+    `[sync-live] dry_run=${args.dryRun} accounts=${accounts.length} limit=${args.limit} concurrency=${CONCURRENCY} lock_hours=${config.GROUP_LOCK_HOURS} scan_start=${scanStart.toISOString()} chain_anchor=height=${anchor.height} time=${new Date(anchor.timeMs).toISOString()}`,
   );
 
   const results = await runConcurrent(accounts, CONCURRENCY, (a) =>
-    syncAccount(a, config, anchor, args),
+    syncAccount(a, config, anchor, scanStart, args),
   );
 
   console.log("\n[sync-live] per-account summary:");
-  let totIns = 0, totUpd = 0, totSkip = 0, totErr = 0;
+  let totIns = 0, totUpd = 0, totClosed = 0, totSkip = 0, totErr = 0;
   for (const r of results) {
     if (r.error) {
       console.log(`  ${pad(r.account, 24)} ERROR: ${r.error}`);
@@ -258,12 +317,12 @@ async function main() {
       continue;
     }
     console.log(
-      `  ${pad(r.account, 24)} fetched=${r.fetched} with_lease=${r.withLease} inserted=${r.inserted} updated=${r.updated} skipped=${r.skipped}`,
+      `  ${pad(r.account, 24)} fetched=${r.fetched} with_lease=${r.withLease} inserted=${r.inserted} updated=${r.updated} closed=${r.closed} skipped=${r.skipped}`,
     );
-    totIns += r.inserted; totUpd += r.updated; totSkip += r.skipped;
+    totIns += r.inserted; totUpd += r.updated; totClosed += r.closed; totSkip += r.skipped;
   }
   console.log(
-    `\n[sync-live] totals: inserted=${totIns} updated=${totUpd} skipped=${totSkip} errors=${totErr} dry_run=${args.dryRun}`,
+    `\n[sync-live] totals: inserted=${totIns} updated=${totUpd} closed=${totClosed} skipped=${totSkip} errors=${totErr} dry_run=${args.dryRun}`,
   );
 
   await closePool();

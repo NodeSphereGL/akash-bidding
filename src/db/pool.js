@@ -21,6 +21,15 @@ export function createPool(config) {
     dateStrings: false,
     timezone: "Z",
   });
+  // Force every connection to UTC. Without this, MySQL session inherits
+  // SYSTEM (e.g. UTC+7 in Vietnam) → NOW() / CURRENT_TIMESTAMP / DEFAULT
+  // values are stored as local but the driver returns them as UTC, breaking
+  // every `expires_at < ?` and `created_at < ?` comparison the daemon does
+  // (sweeper would never release locks, etc.). With session set to '+00:00',
+  // DB time functions match real UTC and align with mysql2's timezone:"Z".
+  _pool.on("connection", (conn) => {
+    conn.query("SET time_zone = '+00:00'");
+  });
   return _pool;
 }
 
